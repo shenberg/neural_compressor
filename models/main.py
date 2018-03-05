@@ -2,9 +2,9 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from layers import LayerNorm
+from .layers import LayerNorm
 import functools
-from sn_layers import SNConv2d
+from .sn_layers import SNConv2d
 
 def _upscale_resize(in_dim, out_dim, kernel_size, norm, non_linearity):
     pad1, pad2 = (kernel_size - 1) // 2, kernel_size // 2

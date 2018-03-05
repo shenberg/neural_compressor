@@ -5,6 +5,7 @@ import os
 import random
 import tqdm
 from torchvision.datasets.folder import make_dataset, default_loader, find_classes
+import tflib as lib
 
 class DatasetSubset(data.Dataset):
     "Subset of existing dataset - useful for train/test split"
@@ -179,4 +180,9 @@ def _mix_samples_bernoulli(reals, fakes, cuda):
     return group1, group2, real_selections
 
 
+def save_images(images_tensor, output_path):
+    samples = images_tensor
+    samples = samples.mul(0.5).add(0.5)
+    samples = samples.cpu().data.numpy()
 
+    lib.save_images.save_images(samples, output_path)
