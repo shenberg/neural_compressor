@@ -415,7 +415,7 @@ def main():
         if iteration % 1000 == 999:
             state_dict = {
                         'iters': iteration + 1,
-                        'algo_params': params,
+                        'algo_params': vars(args),
                         'gen_state_dict': netG.state_dict(),
                         'critic_state_dict': netD.state_dict(),
                         'optimizerG' : optimizerG.state_dict(),
