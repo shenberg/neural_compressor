@@ -31,6 +31,7 @@ from pytorch_ssim import SSIM
 import mmd
 
 import argparse
+import pathlib
 
 class ONE_SIDED_ERROR(nn.Module):
     def __init__(self):
@@ -110,11 +111,10 @@ def main():
 
     args = parser.parse_args()
 
-    RUN_PATH = os.path.join(args.output_base_dir, time.strftime('%Y_%m_%d_%H_%M_%S'))  #TODO: generate by settings
-    if not os.path.exists(RUN_PATH):
-        os.mkdir(RUN_PATH)
+    RUN_PATH = pathlib.Path(args.output_base_dir) / time.strftime('%Y_%m_%d_%H_%M_%S')  #TODO: generate by settings
+    RUN_PATH.mkdir()
     #TODO:hack
-    tflib.plot.log_dir = RUN_PATH
+    tflib.plot.log_dir = str(RUN_PATH)
 
     #TRAIN_RATIO=0.05#0.9
 
@@ -130,7 +130,7 @@ def main():
     NET_G = 'autoencoder-psp'
 
 
-    with open(RUN_PATH + '/algo_params.txt','w') as f:
+    with (RUN_PATH / 'algo_params.txt').open('w') as f:
         import json
         json.dump(vars(args), f, indent=2)
 
@@ -366,13 +366,13 @@ def main():
             optimizerG.step()
 
         # Write logs and save samples
-        lib.plot.plot(RUN_PATH + 'train disc cost', D_cost.cpu().numpy())
-        lib.plot.plot(RUN_PATH + 'time', time.time() - start_time)
-        lib.plot.plot(RUN_PATH + 'train gen cost', G_cost.cpu().numpy())
-        lib.plot.plot(RUN_PATH + 'wasserstein distance', Wasserstein_D.cpu().numpy())
+        lib.plot.plot(str(RUN_PATH / 'train disc cost'), D_cost.cpu().numpy())
+        lib.plot.plot(str(RUN_PATH / 'time'), time.time() - start_time)
+        lib.plot.plot(str(RUN_PATH / 'train gen cost'), G_cost.cpu().numpy())
+        lib.plot.plot(str(RUN_PATH / 'wasserstein distance'), Wasserstein_D.cpu().numpy())
         if args.orthoreg_loss:
-            lib.plot.plot(RUN_PATH + 'ortho loss G', ortho_loss_g.cpu().numpy())
-            lib.plot.plot(RUN_PATH + 'ortho loss D', ortho_loss_d.cpu().numpy())
+            lib.plot.plot(str(RUN_PATH / 'ortho loss G'), ortho_loss_g.cpu().numpy())
+            lib.plot.plot(str(RUN_PATH / 'ortho loss D'), ortho_loss_d.cpu().numpy())
 
 
         # TODO: argument
@@ -400,8 +400,8 @@ def main():
             #    fixed_noise_128 = fixed_noise_128.cuda(gpu)
             #generate_image(iteration, netG, fixed_noise_128)
             #generate_image("{}_reconstruct".format(iteration), netG, encoded.data, True)
-            save_images(real_data_v, RUN_PATH + 'samples_{}_original.jpg'.format(iteration))
-            save_images(fake, RUN_PATH + 'samples_{}_reconstruct.jpg'.format(iteration))
+            save_images(real_data_v, str(RUN_PATH / 'samples_{}_original.jpg'.format(iteration)))
+            save_images(fake, str(RUN_PATH / 'samples_{}_reconstruct.jpg'.format(iteration)))
             #print(encoded)
             #print(fixed_noise_128)
 
@@ -422,7 +422,7 @@ def main():
                         'optimizerD' : optimizerD.state_dict(),
                     }
 
-            torch.save(state_dict, RUN_PATH + 'state_{}.pth.tar'.format(iteration+1))
+            torch.save(state_dict, str(RUN_PATH / 'state_{}.pth.tar'.format(iteration+1)))
 
 if __name__ == "__main__":
     main()
