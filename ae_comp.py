@@ -202,7 +202,7 @@ def main():
 
     optimizer = optim.Adam(encoder.parameters() + decoder.params(), lr=args.learning_rate)
 
-    optimizer = optim.StepLR(optimizer, step_size=args.lr_decay_iters)
+    scheduler = optim.StepLR(optimizer, step_size=args.lr_decay_iters)
 
 
     decoder.train()
@@ -238,6 +238,7 @@ def main():
 
         loss.backward()
         optimizer.step()
+        scheduler.step()
 
         D_cost = loss.data
 
