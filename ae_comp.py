@@ -1,6 +1,6 @@
 import os, sys, time
 sys.path.append(os.getcwd())
-
+import functools
 import torch
 import torchvision
 from torch import nn
@@ -101,7 +101,7 @@ class ResNetEncoder(nn.Module):
         self.final = conv(128, latent_dim, kernel_size=5, padding=2, stride=2, bias=True)
 
     def forward(self, x):
-        h = self.input_transform()
+        h = self.input_transform(x)
         h = self.main(h)
         h = self.final(h)
         return h
@@ -109,8 +109,9 @@ class ResNetEncoder(nn.Module):
 class ResNetDecoder(nn.Module):
     def __init__(self, latent_dim, res_blocks=5, depth=3, conv=nn.ConvTranspose2d):
         super().__init__()
+        # TODO: padding hack
         self.input_transform = nn.Sequential(
-            conv(LATENT_DIM, 128, kernel_size=5, padding=2, stride=2, bias=False),
+            conv(latent_dim, 128, kernel_size=5, padding=1, stride=2, bias=False),
             nn.BatchNorm2d(128),
             nn.ReLU(inplace=True),
             )
@@ -118,14 +119,14 @@ class ResNetDecoder(nn.Module):
             conv(128, 64, kernel_size=5, padding=2, stride=2, bias=False),
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
-            conv(64, 128, kernel_size=5, padding=2, stride=2, bias=True),
+            conv(64, 3, kernel_size=5, padding=2, stride=2, bias=True),
             # TODO: replace with denormalize
             nn.Sigmoid(),
             #nn.BatchNorm2d(128),
             #nn.ReLU(inplace=True),
             )
 
-        blocks = [ResBlock(128, 128, functools.partial(resnet_block, depth=depth, conv=conv)) \
+        blocks = [ResBlock(128, 128, functools.partial(resnet_block, depth=depth, conv=nn.Conv2d)) \
                     for i in range(res_blocks)]
         self.main = nn.Sequential(*blocks)        
 
@@ -133,7 +134,8 @@ class ResNetDecoder(nn.Module):
         h = self.input_transform(x)
         h = self.main(h)
         h = self.output_transform(h)
-        return h
+        #TODO: padding hack
+        return h[:,:,:h.size(2)-1, :h.size(3)-1]
 
 
 def main():
@@ -200,9 +202,9 @@ def main():
     #    torch.set_default_tensor_type('torch.cuda.HalfTensor')
 
 
-    optimizer = optim.Adam(encoder.parameters() + decoder.params(), lr=args.learning_rate)
+    optimizer = optim.Adam(list(encoder.parameters()) + list(decoder.parameters()), lr=args.learning_rate)
 
-    scheduler = optim.StepLR(optimizer, step_size=args.lr_decay_iters)
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=args.lr_decay_iters)
 
 
     decoder.train()
@@ -216,13 +218,13 @@ def main():
 
         start_time = time.time()
 
-        _data = next(gen)
-        encoder.zero_grad()
-        decoder.zero_grad()
-
+        real_data = next(gen)
         if use_cuda:
             real_data = real_data.cuda(gpu, async=True)
         real_data_v = autograd.Variable(real_data)
+        encoder.zero_grad()
+        decoder.zero_grad()
+
 
 
         encoded = encoder(real_data_v)
