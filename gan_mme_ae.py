@@ -94,7 +94,7 @@ def main():
     parser.add_argument("--critic-iters", type=int, default=5, help="number of critic iters per gen iter")
     parser.add_argument("--critic-initial-iters", type=int, default=100, help="number of critic iters per gen iter in initial phase")
     parser.add_argument("--critic-initial-count", type=int, default=5, help="number of critic iters per gen iter")
-    parser.add_argument("--batch-size", type=int, default=24, help="batch size. Bigger is better, limit is RAM")
+    parser.add_argument("--batch-size", type=int, default=32, help="batch size. Bigger is better, limit is RAM")
     parser.add_argument("--iterations", type=int, default=100000, help="generator iterations")
     parser.add_argument("--image-size", type=int, default=64, help="image size (one side, default 64)")
     parser.add_argument("--no-full-image", dest="full_image", action="store_false", help="don't use large image")
@@ -108,6 +108,7 @@ def main():
     parser.add_argument("--generator-ssim-loss", action="store_true")
     parser.add_argument("--generator-ssim-lambda", type=float, default=8)
     parser.add_argument("--use-sn", action="store_true")
+    parser.add_argument("--layers", type=int, default=3, help="number of downscale layers before bottleneck (which also downscales")
 
     args = parser.parse_args()
 
@@ -135,11 +136,11 @@ def main():
         json.dump(vars(args), f, indent=2)
 
     #netG = Generator(DIM, args.latent_dim, args.image_size, GENERATOR_INSTANCE_NORM)
-    #netG = AutoEncoder(DIM, args.latent_dim, args.image_size, GENERATOR_INSTANCE_NORM is not None, fc=FULL_IMAGE)
-    #netG = AutoEncoderUpscale(DIM, args.latent_dim, args.image_size, GENERATOR_INSTANCE_NORM is not None, fc=FULL_IMAGE)
-    netG = AutoEncoderPSP(args.dim, args.latent_dim, args.image_size, args.generator_layer_norm, fc=args.full_image, extra_conv=args.extra_conv)
+    netG = AutoEncoder(args.dim, args.latent_dim, args.image_size, args.generator_layer_norm, fc=args.full_image, extra_conv=args.extra_conv, layers=args.layers)
+    #netG = AutoEncoderUpscale(args.dim, args.latent_dim, args.image_size, args.generator_layer_norm, fc=args.full_image, extra_conv=args.extra_conv, layers=args.layers)
+    #netG = AutoEncoderPSP(args.dim, args.latent_dim, args.image_size, args.generator_layer_norm, fc=args.full_image, extra_conv=args.extra_conv, layers=args.layers)
     if not args.use_sn:
-        netD = Encoder(args.critic_dim, args.dim, use_layer_norm=args.encoder_layer_norm, fc=args.full_image)
+        netD = Encoder(args.critic_dim, args.dim, use_layer_norm=args.encoder_layer_norm, fc=args.full_image, layers=args.layers)
     else:
         netD = SNEncoder(args.critic_dim, args.dim)
 

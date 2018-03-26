@@ -31,7 +31,7 @@ def _upblock(in_dim, out_dim, kernel_size, norm, non_linearity=lambda: nn.ReLU(T
 
 class Generator(nn.Module):
     def __init__(self, dim=64, input_dim=128, output_size=64, norm=LayerNorm, kernel_size=4, fc=False, upblock=_upblock,
-                 non_linearity=functools.partial(nn.ReLU, inplace=True), extra_conv=False):
+                 non_linearity=functools.partial(nn.ReLU, inplace=True), extra_conv=False, layers=3):
         super(Generator, self).__init__()
         self.output_size = output_size # TODO: verify power-of-two, square
         # number of expand layers we need
@@ -39,7 +39,8 @@ class Generator(nn.Module):
         # so bit length  (==log2 of power-of-two number) of output/input sizes 
         # is the numer of layers we need
         # subtract 1 because we always create the output layer not inside the sequential layer
-        self.layers = (output_size // 4).bit_length() - 2
+        # TODO: fix for layers param when not FC
+        self.layers = layers # (output_size // 4).bit_length() - 2
         self.dim = dim
         # full-convolutional? make first layer Conv2d instead of linear if so
         self.fc = fc
@@ -88,10 +89,10 @@ class Generator(nn.Module):
 
 
 class Encoder(nn.Module):
-    def __init__(self, dim, output_dim=128, input_size=64, use_layer_norm=False, in_dim=3, kernel_size=4, use_linear=True, fc=False):
+    def __init__(self, dim, output_dim=128, input_size=64, use_layer_norm=False, in_dim=3, kernel_size=4, use_linear=True, fc=False, layers=3):
         super().__init__()
         self.dim = dim
-        self.layers = (input_size // 4).bit_length() - 1
+        self.layers = layers # (input_size // 4).bit_length() - 1
 
         blocks = []
 
@@ -112,6 +113,7 @@ class Encoder(nn.Module):
         self.use_linear = use_linear
         if use_linear:
             if not fc:
+                #TODO: fix for new layers param
                 self.linear = nn.Linear(4 * 4 * out_dim, output_dim)
             else:
                 #self.linear = nn.Conv2d(out_dim, output_dim, 4, padding=1, stride=2, bias=True)
@@ -275,19 +277,19 @@ class FeatureComparator(nn.Module):
 
 
 class AutoEncoder(nn.Module):
-    def __init__(self, dim=64, encoding_dim=128, input_size=64, use_layer_norm=False, fc=False):
+    def __init__(self, dim=64, encoding_dim=128, input_size=64, use_layer_norm=False, fc=False, extra_conv=False, layers=3):
         super().__init__()
-        self.encoder = Encoder(dim, encoding_dim, input_size, use_layer_norm=use_layer_norm, fc=fc)
-        self.decoder = Generator(dim, encoding_dim, input_size, norm=LayerNorm if use_layer_norm else None, fc=fc)
+        self.encoder = Encoder(dim, encoding_dim, input_size, use_layer_norm=use_layer_norm, fc=fc, layers=layers)
+        self.decoder = Generator(dim, encoding_dim, input_size, norm=LayerNorm if use_layer_norm else None, fc=fc, extra_conv=extra_conv, layers=layers-1)
 
     def forward(self, x):
         return self.decoder(self.encoder(x))
 
 class AutoEncoderUpscale(nn.Module):
-    def __init__(self, dim=64, encoding_dim=128, input_size=64, use_layer_norm=False, fc=False):
+    def __init__(self, dim=64, encoding_dim=128, input_size=64, use_layer_norm=False, fc=False, extra_conv=False, layers=3):
         super().__init__()
-        self.encoder = Encoder(dim, encoding_dim, input_size, use_layer_norm=use_layer_norm, fc=fc)
-        self.decoder = Generator(dim, encoding_dim, input_size, norm=LayerNorm if use_layer_norm else None, fc=fc, kernel_size=3, upblock=_upscale_resize)
+        self.encoder = Encoder(dim, encoding_dim, input_size, use_layer_norm=use_layer_norm, fc=fc, layers=layers)
+        self.decoder = Generator(dim, encoding_dim, input_size, norm=LayerNorm if use_layer_norm else None, fc=fc, kernel_size=3, upblock=_upscale_resize, extra_conv=extra_conv, layers=layers-1)
 
     def forward(self, x):
         return self.decoder(self.encoder(x))
@@ -329,18 +331,26 @@ class PSPUpsample(nn.Module):
 
 
 class AutoEncoderPSP(nn.Module):
-    def __init__(self, dim=64, encoding_dim=128, input_size=64, use_layer_norm=False, fc=False, extra_conv=False):
+    def __init__(self, dim=64, encoding_dim=128, input_size=64, use_layer_norm=False, fc=False, extra_conv=False, layers=3):
         super().__init__()
 
-        self.encoder = Encoder(dim, encoding_dim, input_size, use_layer_norm=use_layer_norm, fc=fc)
+        self.encoder = Encoder(dim, encoding_dim, input_size, use_layer_norm=use_layer_norm, fc=fc, layers=layers)
         self.psp_module = PSPModule(encoding_dim, encoding_dim)
+        # TODO: hack! decoder has outblock scaling not counting in # of upsamples
         self.decoder = Generator(dim, encoding_dim, input_size, 
                                  norm=LayerNorm if use_layer_norm else None, fc=fc, kernel_size=3, upblock=_upscale_resize,
-                                 extra_conv=extra_conv)
+                                 extra_conv=extra_conv, layers=layers-1)
         
 
     def forward(self, x):
-        return self.decoder(self.psp_module(self.encoder(x)))
+        #print(x.size())
+        h = self.encoder(x)
+        #print(h.size())
+        h = self.psp_module(h)
+        #print(h.size())
+        h = self.decoder(h)
+        #print(h.size())
+        return h
 
 class SNEncoder(nn.Module):
     def __init__(self, dim, output_dim):
