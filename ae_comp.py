@@ -138,6 +138,50 @@ class ResNetDecoder(nn.Module):
         return h[:,:,:h.size(2)-1, :h.size(3)-1]
 
 
+# Encode 1d samples, separate encoder per channel
+class SoftToHardEncoder(nn.Module):
+    def __init__(self, num_codes, latent_dim):
+        super().__init__()
+        # centers - each row represents the centers for a channel
+        # each column is a specific center
+        self.codes = nn.Embedding(latent_dim, num_codes)
+        self.num_codes = num_codes
+        self.latent_dim = latent_dim
+
+        self.softmin = nn.Softmin(dim=4) # intended to work on BxHxWxCxnum_codes matrices
+
+    def forward(self, z):
+        h = z
+        # BCWH -> BWHC
+        h = h.permute(0,2,3,1)
+        h = h.contiguous()
+
+        # change W to 1x1x1xCxnum_codes to get desired broadcast behavior
+        W = self.codes.weight[None,None,None]
+        # duplicate each channel value along the last axis
+        # so now BxWxHxCxnum_codes matrix
+        expanded = h.unsqueeze(-1).expand(h.size() + (self.num_codes,))
+
+        distances = (expanded - W).abs()
+
+        symbol_probs = self.softmin(distances)
+        # sum of symbols weighted by their odds
+        # now we have a BWHC matrix again
+        soft_symbols = (symbol_probs * W).sum(dim=4)
+
+        # Get the index of the center chosen per channel
+        # BxWxHxCxnum_channels -> BWHC
+        idxes = distances.min(dim=4)[1] 
+        # calculate row offset for each channel
+        # TODO: cuda hack
+        offsets = autograd.Variable(torch.arange(0, self.latent_dim * self.num_codes, self.num_codes,
+                    out=torch.cuda.LongTensor((1,1,1,self.latent_dim))))
+        # take the corresponding center from each channel
+        hard_symbols = W.take(idxes + offsets)
+        #j = L2_dist(z[:,None],W[None,:]).sum(2).min(1)[1]
+        return soft_symbols, hard_symbols
+
+
 def main():
     parser = argparse.ArgumentParser(description="options")
     parser.add_argument("-o", "--output-base-dir", default="/mnt/7FC1A7CD7234342C/compression-results/")
@@ -145,6 +189,7 @@ def main():
     parser.add_argument("--data-dir", default="/mnt/7FC1A7CD7234342C/compression/dataset", help="path to image dataset")
     parser.add_argument("--dim", type=int, default=64, help="base dimension for generator")
     parser.add_argument("--latent-dim", type=int, default=128, help="latent dimension for autoencoder")
+    parser.add_argument("--num-centers", type=int, default=16, help="number of centers for quantization")
     parser.add_argument("--batch-size", type=int, default=32, help="batch size. Bigger is better, limit is RAM")
     parser.add_argument("--iterations", type=int, default=100000, help="generator iterations")
     parser.add_argument("--lr-decay-iters", type=int, default=10000, help="time till decay")
@@ -164,6 +209,7 @@ def main():
 
     encoder = ResNetEncoder(latent_dim=args.latent_dim)
     decoder = ResNetDecoder(latent_dim=args.latent_dim)
+    quantizer = SoftToHardEncoder(num_codes=args.num_centers, latent_dim=args.latent_dim)
 
     decoder.apply(weights_init)
     encoder.apply(weights_init)
@@ -179,6 +225,7 @@ def main():
         torch.backends.cudnn.benchmark = True
         encoder = encoder.cuda(gpu)
         decoder = decoder.cuda(gpu)
+        quantizer = quantizer.cuda(gpu)
         mse_loss = mse_loss.cuda(gpu)
         ssim_loss = ssim_loss.cuda(gpu)
 
@@ -202,13 +249,15 @@ def main():
     #    torch.set_default_tensor_type('torch.cuda.HalfTensor')
 
 
-    optimizer = optim.Adam(list(encoder.parameters()) + list(decoder.parameters()), lr=args.learning_rate)
+    optimizer = optim.Adam(list(encoder.parameters()) + list(decoder.parameters())
+                         + list(quantizer.parameters()), lr=args.learning_rate)
 
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=args.lr_decay_iters)
 
 
     decoder.train()
     encoder.train()
+    quantizer.train()
 
 
     gen = inf_train_gen(train_gen)
@@ -225,9 +274,12 @@ def main():
         encoder.zero_grad()
         decoder.zero_grad()
 
-
-
         encoded = encoder(real_data_v)
+
+        soft, hard = quantizer(encoded)
+
+        quantized = (hard - soft).detach() + soft # use soft symbol for backprop
+
         decoded = decoder(encoded)
             
         loss = mse_loss(decoded, real_data_v)
