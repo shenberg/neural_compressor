@@ -279,8 +279,11 @@ def main():
         soft, hard = quantizer(encoded)
 
         quantized = (hard - soft).detach() + soft # use soft symbol for backprop
+        #TODO: move into quantizer
+        quantized = quantized.permute(0,3,1,2)
 
-        decoded = decoder(encoded)
+
+        decoded = decoder(quantized)
             
         loss = mse_loss(decoded, real_data_v)
 
@@ -347,6 +350,7 @@ def main():
                         'algo_params': vars(args),
                         'decoder_dict': decoder.state_dict(),
                         'encoder_dict': encoder.state_dict(),
+                        'quantizer': quantizer.state_dict(),
                         'optimizerG' : optimizer.state_dict(),
                     }
 
