@@ -98,7 +98,14 @@ class ResNetEncoder(nn.Module):
         blocks = [ResBlock(128, 128, functools.partial(resnet_block, depth=depth, conv=conv)) \
                     for i in range(res_blocks)]
         self.main = nn.Sequential(*blocks)
+        # In paper, this:
         self.final = conv(128, latent_dim, kernel_size=5, padding=2, stride=2, bias=True)
+        # but details imply this:
+        # self.final = nn.Sequential(
+        #             conv(128, latent_dim, kernel_size=5, padding=2, stride=2, bias=True),
+        #             # TODO: test BN here too
+        #             nn.ReLU(inplace=True),
+        #             )
 
     def forward(self, x):
         h = self.input_transform(x)
@@ -182,6 +189,55 @@ class SoftToHardEncoder(nn.Module):
         return soft_symbols, hard_symbols
 
 
+# TODO: implement as kernel_size / 2 with one-sided padding
+class MaskedConv3d(nn.Conv3d):
+    def __init__(self, mask_type, *args, **kwargs):
+        super(MaskedConv3d, self).__init__(*args, **kwargs)
+        assert mask_type in {'A', 'B'}
+        self.register_buffer('mask', self.weight.data.clone())
+        _, _, kC, kH, kW = self.weight.size()
+        self.mask.fill_(1)
+        # fill far half of the buffer with 0 (Z points away)
+        self.mask[:, :, kC // 2 + 1:] = 0
+        # for middle slice, fill bottom half of slice with 0s (Y points down)
+        self.mask[:, :, kC // 2, kH // 2 + 1:] = 0
+        # for middle row of middle slice, fill end of row with 0s
+        # NOTE: first layer must have mask type 'A', which zeros out the middle weight too
+        #       this is because to predict the voxel we must not use the input as a value
+        self.mask[:, :, kC // 2, kH // 2, kW // 2 + (mask_type == 'B'):] = 0
+
+    def forward(self, x):
+        self.weight.data *= self.mask
+        return super(MaskedConv3d, self).forward(x)
+
+
+def ContextModel(nn.Module):
+    def __init__(self, centers, channels=24, kernel_size=3):
+        super().__init_()
+        self.initial = nn.Sequential(
+            MaskedConv3d('A', 1, channels, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True)
+            )
+        self.main = nn.Sequential(
+            MaskedConv3d('B', channels, channels, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            MaskedConv3d('B', channels, channels, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True)
+            )
+        # In paper:
+        # self.output = nn.Sequential(
+            # MaskedConv3d('B', channels, centers, kernel_size=3, padding=1),
+            # nn.ReLU(inplace=True)
+            # )
+        # ReLU shouldn't matter...
+        self.output = MaskedConv3d('B', channels, centers, kernel_size=3, padding=1)
+
+    def forward(self, x):
+        h = self.initial(x)
+        h = h + self.main(h)
+        return self.output(h)
+
+
 def main():
     parser = argparse.ArgumentParser(description="options")
     parser.add_argument("-o", "--output-base-dir", default="/mnt/7FC1A7CD7234342C/compression-results/")
@@ -189,7 +245,7 @@ def main():
     parser.add_argument("--data-dir", default="/mnt/7FC1A7CD7234342C/compression/dataset", help="path to image dataset")
     parser.add_argument("--dim", type=int, default=64, help="base dimension for generator")
     parser.add_argument("--latent-dim", type=int, default=128, help="latent dimension for autoencoder")
-    parser.add_argument("--num-centers", type=int, default=16, help="number of centers for quantization")
+    parser.add_argument("--num-centers", type=int, default=2, help="number of centers for quantization")
     parser.add_argument("--batch-size", type=int, default=32, help="batch size. Bigger is better, limit is RAM")
     parser.add_argument("--iterations", type=int, default=100000, help="generator iterations")
     parser.add_argument("--lr-decay-iters", type=int, default=10000, help="time till decay")
@@ -201,7 +257,7 @@ def main():
     RUN_PATH = pathlib.Path(args.output_base_dir) / time.strftime('%Y_%m_%d_%H_%M_%S')  #TODO: generate by settings
     RUN_PATH.mkdir()
     #TODO:hack
-    tflib.plot.log_dir = str(RUN_PATH)
+    tflib.plot.log_dir = str(RUN_PATH) + '/'
 
     with (RUN_PATH / 'algo_params.txt').open('w') as f:
         import json
