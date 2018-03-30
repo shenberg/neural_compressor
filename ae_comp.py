@@ -179,14 +179,14 @@ class SoftToHardEncoder(nn.Module):
         # Get the index of the center chosen per channel
         # BxWxHxCxnum_channels -> BWHC
         idxes = distances.min(dim=4)[1] 
-        # calculate row offset for each channel
+        # calculate row offset for each channel for lookup into dictionary
         # TODO: cuda hack
         offsets = autograd.Variable(torch.arange(0, self.latent_dim * self.num_codes, self.num_codes,
                     out=torch.cuda.LongTensor((1,1,1,self.latent_dim))))
         # take the corresponding center from each channel
         hard_symbols = W.take(idxes + offsets)
         #j = L2_dist(z[:,None],W[None,:]).sum(2).min(1)[1]
-        return soft_symbols, hard_symbols
+        return soft_symbols, hard_symbols, idxes
 
 
 # TODO: implement as kernel_size / 2 with one-sided padding
@@ -211,9 +211,9 @@ class MaskedConv3d(nn.Conv3d):
         return super(MaskedConv3d, self).forward(x)
 
 
-def ContextModel(nn.Module):
+class ContextModel(nn.Module):
     def __init__(self, centers, channels=24, kernel_size=3):
-        super().__init_()
+        super().__init__()
         self.initial = nn.Sequential(
             MaskedConv3d('A', 1, channels, kernel_size=3, padding=1),
             nn.ReLU(inplace=True)
@@ -233,7 +233,7 @@ def ContextModel(nn.Module):
         self.output = MaskedConv3d('B', channels, centers, kernel_size=3, padding=1)
 
     def forward(self, x):
-        h = self.initial(x)
+        h = self.initial(x[:,None])
         h = h + self.main(h)
         return self.output(h)
 
@@ -244,13 +244,13 @@ def main():
     parser.add_argument("-lr", "--learning-rate", type=float, default=4e-3)
     parser.add_argument("--data-dir", default="/mnt/7FC1A7CD7234342C/compression/dataset", help="path to image dataset")
     parser.add_argument("--dim", type=int, default=64, help="base dimension for generator")
-    parser.add_argument("--latent-dim", type=int, default=128, help="latent dimension for autoencoder")
-    parser.add_argument("--num-centers", type=int, default=2, help="number of centers for quantization")
+    parser.add_argument("--latent-dim", type=int, default=32, help="latent dimension for autoencoder")
+    parser.add_argument("--num-centers", type=int, default=6, help="number of centers for quantization")
     parser.add_argument("--batch-size", type=int, default=32, help="batch size. Bigger is better, limit is RAM")
     parser.add_argument("--iterations", type=int, default=100000, help="generator iterations")
     parser.add_argument("--lr-decay-iters", type=int, default=10000, help="time till decay")
     parser.add_argument("--image-size", type=int, default=160, help="image size (one side, default 64)")
-    parser.add_argument("--layers", type=int, default=3, help="number of downscale layers before bottleneck (which also downscales")
+    parser.add_argument("--coding-loss-beta", type=float, default=0.1, help="constant multiplier for entropy loss")
 
     args = parser.parse_args()
 
@@ -266,12 +266,14 @@ def main():
     encoder = ResNetEncoder(latent_dim=args.latent_dim)
     decoder = ResNetDecoder(latent_dim=args.latent_dim)
     quantizer = SoftToHardEncoder(num_codes=args.num_centers, latent_dim=args.latent_dim)
+    context_model = ContextModel(args.num_centers)
 
     decoder.apply(weights_init)
     encoder.apply(weights_init)
     print(decoder)
     print(encoder)
     use_cuda = torch.cuda.is_available()
+    ce_loss = torch.nn.CrossEntropyLoss()
     ssim_loss = SSIM()
     # TODO: proper MS-SSIM
     mse_loss = torch.nn.MSELoss()
@@ -282,10 +284,12 @@ def main():
         encoder = encoder.cuda(gpu)
         decoder = decoder.cuda(gpu)
         quantizer = quantizer.cuda(gpu)
+        context_model = context_model.cuda(gpu)
         mse_loss = mse_loss.cuda(gpu)
         ssim_loss = ssim_loss.cuda(gpu)
+        ce_loss = ce_loss.cuda(gpu)
 
-
+    beta = args.coding_loss_beta
     # pre-processing transform
     # augmentation goes here, e.g. RandomResizedCrop instead of regular random crop
     transform = torchvision.transforms.Compose([
@@ -310,11 +314,9 @@ def main():
 
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=args.lr_decay_iters)
 
-
     decoder.train()
     encoder.train()
     quantizer.train()
-
 
     gen = inf_train_gen(train_gen)
     #torch.set_default_tensor_type('torch.HalfTensor')
@@ -332,12 +334,14 @@ def main():
 
         encoded = encoder(real_data_v)
 
-        soft, hard = quantizer(encoded)
+        soft, hard, symbols = quantizer(encoded)
 
         quantized = (hard - soft).detach() + soft # use soft symbol for backprop
         #TODO: move into quantizer
         quantized = quantized.permute(0,3,1,2)
 
+        predictions = context_model(quantized)
+        coding_loss = ce_loss(predictions, symbols.permute(0,3,1,2))
 
         decoded = decoder(quantized)
             
@@ -349,7 +353,7 @@ def main():
             #     orthoreg.orthoreg_loss(netD, ortho_loss_v)
             #     loss += ortho_loss_v
 
-        loss.backward()
+        (loss + beta*coding_loss).backward()
         optimizer.step()
         scheduler.step()
 
@@ -357,6 +361,7 @@ def main():
 
         # Write logs and save samples
         lib.plot.plot(str(RUN_PATH / 'reconstruction loss'), D_cost.cpu().numpy())
+        lib.plot.plot(str(RUN_PATH / 'coding loss'), coding_loss.data.cpu().numpy())
         lib.plot.plot(str(RUN_PATH / 'time'), time.time() - start_time)
         # if args.orthoreg_loss:
         #     lib.plot.plot(str(RUN_PATH / 'ortho loss G'), ortho_loss_g.cpu().numpy())
