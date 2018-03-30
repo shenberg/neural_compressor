@@ -225,12 +225,12 @@ class ContextModel(nn.Module):
             nn.ReLU(inplace=True)
             )
         # In paper:
-        # self.output = nn.Sequential(
-            # MaskedConv3d('B', channels, centers, kernel_size=3, padding=1),
-            # nn.ReLU(inplace=True)
-            # )
+        self.output = nn.Sequential(
+            MaskedConv3d('B', channels, centers, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True)
+            )
         # ReLU shouldn't matter...
-        self.output = MaskedConv3d('B', channels, centers, kernel_size=3, padding=1)
+        #self.output = MaskedConv3d('B', channels, centers, kernel_size=3, padding=1)
 
     def forward(self, x):
         h = self.initial(x[:,None])
@@ -250,7 +250,7 @@ def main():
     parser.add_argument("--iterations", type=int, default=100000, help="generator iterations")
     parser.add_argument("--lr-decay-iters", type=int, default=10000, help="time till decay")
     parser.add_argument("--image-size", type=int, default=160, help="image size (one side, default 64)")
-    parser.add_argument("--coding-loss-beta", type=float, default=0.1, help="constant multiplier for entropy loss")
+    parser.add_argument("--coding-loss-beta", type=float, default=0.05, help="constant multiplier for entropy loss")
 
     args = parser.parse_args()
 
@@ -405,13 +405,14 @@ def main():
         lib.plot.tick()
 
         # TODO: argument
-        if iteration % 1000 == 999:
+        if iteration % 2000 == 1999:
             state_dict = {
                         'iters': iteration + 1,
                         'algo_params': vars(args),
                         'decoder_dict': decoder.state_dict(),
                         'encoder_dict': encoder.state_dict(),
                         'quantizer': quantizer.state_dict(),
+                        'context_model': context_model.state_dict(),
                         'optimizerG' : optimizer.state_dict(),
                     }
 
