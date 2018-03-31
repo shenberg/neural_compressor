@@ -246,9 +246,9 @@ def main():
     parser.add_argument("--dim", type=int, default=64, help="base dimension for generator")
     parser.add_argument("--latent-dim", type=int, default=32, help="latent dimension for autoencoder")
     parser.add_argument("--num-centers", type=int, default=6, help="number of centers for quantization")
-    parser.add_argument("--batch-size", type=int, default=32, help="batch size. Bigger is better, limit is RAM")
+    parser.add_argument("--batch-size", type=int, default=48, help="batch size. Bigger is better, limit is RAM")
     parser.add_argument("--iterations", type=int, default=100000, help="generator iterations")
-    parser.add_argument("--lr-decay-iters", type=int, default=10000, help="time till decay")
+    parser.add_argument("--lr-decay-iters", type=int, default=15000, help="time till decay")
     parser.add_argument("--image-size", type=int, default=160, help="image size (one side, default 64)")
     parser.add_argument("--coding-loss-beta", type=float, default=0.05, help="constant multiplier for entropy loss")
 
