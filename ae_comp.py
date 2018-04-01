@@ -82,15 +82,23 @@ def resnet_block(in_dim, out_dim, depth=3, conv=nn.Conv2d):
     blocks.append(ResBlock(in_dim, out_dim, inner_block_func))
     return nn.Sequential(*blocks)
 
+def downscale(in_channels, out_channels):
+    return [nn.Conv2d(in_channels, out_channels, kernel_size=5, padding=2, stride=2, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),]
 
 class ResNetEncoder(nn.Module):
     def __init__(self, latent_dim, res_blocks=5, depth=3, conv=nn.Conv2d):
         super().__init__()
         self.input_transform = nn.Sequential(
-            conv(3, 64, kernel_size=5, padding=2, stride=2, bias=False),
+            #*(downscale(3, 64) + downscale(64, 128)
+            conv(3, 64, kernel_size=3, padding=1, stride=1, bias=False),
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
-            conv(64, 128, kernel_size=5, padding=2, stride=2, bias=False),
+            conv(64, 64, kernel_size=4, padding=1, stride=2, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            conv(64, 128, kernel_size=4, padding=1, stride=2, bias=False),
             nn.BatchNorm2d(128),
             nn.ReLU(inplace=True),
             )
@@ -99,7 +107,8 @@ class ResNetEncoder(nn.Module):
                     for i in range(res_blocks)]
         self.main = nn.Sequential(*blocks)
         # In paper, this:
-        self.final = conv(128, latent_dim, kernel_size=5, padding=2, stride=2, bias=True)
+        #self.final = conv(128, latent_dim, kernel_size=5, padding=2, stride=2, bias=True)
+        self.final = nn.Conv2d(128, latent_dim, kernel_size=4, padding=1, stride=2, bias=True)
         # but details imply this:
         # self.final = nn.Sequential(
         #             conv(128, latent_dim, kernel_size=5, padding=2, stride=2, bias=True),
@@ -113,25 +122,49 @@ class ResNetEncoder(nn.Module):
         h = self.final(h)
         return h
 
+def _upscale_resize(in_dim, out_dim, kernel_size):
+    pad1, pad2 = (kernel_size - 1) // 2, kernel_size // 2
+
+    block = [
+        nn.Upsample(scale_factor=2, mode='nearest'),
+        nn.ReflectionPad2d((pad1, pad2, pad1, pad2)),
+        nn.Conv2d(in_dim, out_dim, kernel_size, bias=False),
+        nn.BatchNorm2d(out_dim),
+        nn.ReLU(True)
+        ]
+    return block
+
 class ResNetDecoder(nn.Module):
     def __init__(self, latent_dim, res_blocks=5, depth=3, conv=nn.ConvTranspose2d):
         super().__init__()
+        self.input_transform = nn.Sequential(*_upscale_resize(latent_dim, 128, 5))
         # TODO: padding hack
-        self.input_transform = nn.Sequential(
-            conv(latent_dim, 128, kernel_size=5, padding=1, stride=2, bias=False),
-            nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True),
-            )
+        # self.input_transform = nn.Sequential(
+        #     conv(latent_dim, 128, kernel_size=5, padding=1, stride=2, bias=False),
+        #     #conv(latent_dim, 128, kernel_size=4, padding=1, stride=2, bias=False),
+        #     #nn.BatchNorm2d(128),
+        #     nn.ReLU(inplace=True),
+        #     )
         self.output_transform = nn.Sequential(
-            conv(128, 64, kernel_size=5, padding=2, stride=2, bias=False),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-            conv(64, 3, kernel_size=5, padding=2, stride=2, bias=True),
-            # TODO: replace with denormalize
-            nn.Sigmoid(),
-            #nn.BatchNorm2d(128),
-            #nn.ReLU(inplace=True),
+            *(_upscale_resize(128, 64, 5) + _upscale_resize(64,64,5) +
+                [conv(64, 3, kernel_size=3, padding=1, stride=1, bias=True),
+                 nn.Sigmoid()])
             )
+        # self.output_transform = nn.Sequential(
+        #     conv(128, 64, kernel_size=5, padding=2, stride=2, bias=False),
+        #     #conv(128, 64, kernel_size=4, padding=1, stride=2, bias=False),
+        #     nn.BatchNorm2d(64),
+        #     nn.ReLU(inplace=True),
+        #     conv(64, 3, kernel_size=5, padding=2, stride=2, bias=True),
+        #     #conv(64, 64, kernel_size=4, padding=1, stride=2, bias=False),
+        #     #nn.BatchNorm2d(64),
+        #     #nn.ReLU(inplace=True),
+        #     #conv(64, 3, kernel_size=3, padding=1, stride=1, bias=True),
+        #     # TODO: replace with denormalize
+        #     nn.Sigmoid(),
+        #     #nn.BatchNorm2d(128),
+        #     #nn.ReLU(inplace=True),
+        #     )
 
         blocks = [ResBlock(128, 128, functools.partial(resnet_block, depth=depth, conv=nn.Conv2d)) \
                     for i in range(res_blocks)]
@@ -141,8 +174,9 @@ class ResNetDecoder(nn.Module):
         h = self.input_transform(x)
         h = self.main(h)
         h = self.output_transform(h)
+        return h
         #TODO: padding hack
-        return h[:,:,:h.size(2)-1, :h.size(3)-1]
+        #return h[:,:,:h.size(2)-1, :h.size(3)-1]
 
 
 # Encode 1d samples, separate encoder per channel
@@ -250,6 +284,7 @@ def main():
     parser.add_argument("--iterations", type=int, default=100000, help="generator iterations")
     parser.add_argument("--lr-decay-iters", type=int, default=15000, help="time till decay")
     parser.add_argument("--image-size", type=int, default=160, help="image size (one side, default 64)")
+    parser.add_argument("--context-learning-rate", type=float, default=1e-4)
     parser.add_argument("--coding-loss-beta", type=float, default=0.05, help="constant multiplier for entropy loss")
 
     args = parser.parse_args()
@@ -311,8 +346,11 @@ def main():
 
     optimizer = optim.Adam(list(encoder.parameters()) + list(decoder.parameters())
                          + list(quantizer.parameters()), lr=args.learning_rate)
+    optimizer_context = optim.Adam(list(context_model.parameters()),
+                                    lr=args.context_learning_rate)
 
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=args.lr_decay_iters)
+    scheduler_context = optim.lr_scheduler.StepLR(optimizer_context, step_size=args.lr_decay_iters)
 
     decoder.train()
     encoder.train()
@@ -331,6 +369,8 @@ def main():
         real_data_v = autograd.Variable(real_data)
         encoder.zero_grad()
         decoder.zero_grad()
+        quantizer.zero_grad()
+        context_model.zero_grad()
 
         encoded = encoder(real_data_v)
 
@@ -355,7 +395,9 @@ def main():
 
         (loss + beta*coding_loss).backward()
         optimizer.step()
+        optimizer_context.step()
         scheduler.step()
+        scheduler_context.step()
 
         D_cost = loss.data
 
@@ -413,7 +455,8 @@ def main():
                         'encoder_dict': encoder.state_dict(),
                         'quantizer': quantizer.state_dict(),
                         'context_model': context_model.state_dict(),
-                        'optimizerG' : optimizer.state_dict(),
+                        'optimizer' : optimizer.state_dict(),
+                        'optimizer_context' : optimizer_context.state_dict(),
                     }
 
             torch.save(state_dict, str(RUN_PATH / 'state_{}.pth.tar'.format(iteration+1)))
