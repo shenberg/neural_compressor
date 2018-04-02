@@ -278,14 +278,15 @@ def main():
     parser.add_argument("-lr", "--learning-rate", type=float, default=4e-3)
     parser.add_argument("--data-dir", default="/mnt/7FC1A7CD7234342C/compression/dataset", help="path to image dataset")
     parser.add_argument("--dim", type=int, default=64, help="base dimension for generator")
-    parser.add_argument("--latent-dim", type=int, default=32, help="latent dimension for autoencoder")
-    parser.add_argument("--num-centers", type=int, default=6, help="number of centers for quantization")
-    parser.add_argument("--batch-size", type=int, default=48, help="batch size. Bigger is better, limit is RAM")
+    parser.add_argument("--latent-dim", type=int, default=64, help="latent dimension for autoencoder")
+    parser.add_argument("--num-centers", type=int, default=8, help="number of centers for quantization")
+    parser.add_argument("--batch-size", type=int, default=32, help="batch size. Bigger is better, limit is RAM")
     parser.add_argument("--iterations", type=int, default=100000, help="generator iterations")
-    parser.add_argument("--lr-decay-iters", type=int, default=15000, help="time till decay")
+    parser.add_argument("--lr-decay-iters", type=int, default=10000, help="time till decay")
     parser.add_argument("--image-size", type=int, default=160, help="image size (one side, default 64)")
     parser.add_argument("--context-learning-rate", type=float, default=1e-4)
-    parser.add_argument("--coding-loss-beta", type=float, default=0.05, help="constant multiplier for entropy loss")
+    parser.add_argument("--weight-decay", type=float, default=1e-6)
+    parser.add_argument("--coding-loss-beta", type=float, default=0.01, help="constant multiplier for entropy loss")
 
     args = parser.parse_args()
 
@@ -345,9 +346,9 @@ def main():
 
 
     optimizer = optim.Adam(list(encoder.parameters()) + list(decoder.parameters())
-                         + list(quantizer.parameters()), lr=args.learning_rate)
+                         + list(quantizer.parameters()), lr=args.learning_rate, weight_decay=args.weight_decay)
     optimizer_context = optim.Adam(list(context_model.parameters()),
-                                    lr=args.context_learning_rate)
+                                    lr=args.context_learning_rate, weight_decay=args.weight_decay)
 
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=args.lr_decay_iters)
     scheduler_context = optim.lr_scheduler.StepLR(optimizer_context, step_size=args.lr_decay_iters)
