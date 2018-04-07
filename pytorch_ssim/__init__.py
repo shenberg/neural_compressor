@@ -77,11 +77,12 @@ class MS_SSIM(torch.nn.Module):
             weights = self.weights_base
             if img1.is_cuda:
                 weights = weights.cuda()
-            weights = weights.as_type(img1)
+            weights = weights.type_as(img1)
             self.weights = weights
 
         csses = []
         for i in range(len(weights)):
+            #print(img1.size(),img2.size())
             cs, ssim = _ssim(img1, img2, window, self.window_size, channel, self.max_val)
             csses.append(cs)
             img1 = self.downscale(img1)
