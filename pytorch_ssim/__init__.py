@@ -46,7 +46,7 @@ def _ssim(img1, img2, window, window_size, channel, max_val=255.0):
 
 
 class MS_SSIM(torch.nn.Module):
-    def __init__(self, window_size = 11, max_val = 1.0, size_average = True, weights = None):
+    def __init__(self, window_size = 11, max_val = 1.0, size_average = True, weights = None, mode='product'):
         super(MS_SSIM, self).__init__()
         self.window_size = window_size
         self.size_average = size_average
@@ -56,6 +56,9 @@ class MS_SSIM(torch.nn.Module):
         self.weights = self.weights_base
         self.max_val = max_val
         self.downscale = nn.AvgPool2d(2, 2)
+        if mode not in ('product','sum'):
+            raise ValueError('invalid mode ' + mode)
+        self.mode = mode
 
     def forward(self, img1, img2):
         (_, channel, _, _) = img1.size()
@@ -89,7 +92,14 @@ class MS_SSIM(torch.nn.Module):
             img2 = self.downscale(img2)
         #print(csses)
         #print(ssim)
-        results = (torch.stack(csses[:-1] + [ssim], dim=1)**weights).prod(dim=1)
+        result_array = torch.stack(csses[:-1] + [ssim], dim=1)
+        #print(result_array)
+        #print(weights)
+        if self.mode == 'product':
+            results = (result_array**weights).prod(dim=1)
+        else:
+            results = (result_array * weights).sum(dim=1) / weights.sum()
+        #print(results)
         if not self.size_average:
             return results
         else:

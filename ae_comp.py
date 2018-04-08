@@ -27,7 +27,7 @@ from losses import gradient_penalty_loss
 
 from utils import DatasetSubset, mix_samples, _mix_samples, load_batches, batchify, EagerFolder, save_images
 import orthoreg
-from pytorch_ssim import SSIM
+from pytorch_ssim import MS_SSIM
 import mmd
 
 import argparse
@@ -271,8 +271,9 @@ class ContextModel(nn.Module):
         h = h + self.main(h)
         return self.output(h)
 
-
+#decoded, real_data_v = 0, 0
 def main():
+    #global decoded, real_data_v
     parser = argparse.ArgumentParser(description="options")
     parser.add_argument("-o", "--output-base-dir", default="/mnt/7FC1A7CD7234342C/compression-results/")
     parser.add_argument("-lr", "--learning-rate", type=float, default=4e-3)
@@ -283,9 +284,11 @@ def main():
     parser.add_argument("--batch-size", type=int, default=32, help="batch size. Bigger is better, limit is RAM")
     parser.add_argument("--iterations", type=int, default=100000, help="generator iterations")
     parser.add_argument("--lr-decay-iters", type=int, default=10000, help="time till decay")
-    parser.add_argument("--image-size", type=int, default=160, help="image size (one side, default 64)")
+    parser.add_argument("--image-size", type=int, default=176, help="image size (one side, default 64)")
     parser.add_argument("--context-learning-rate", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-6)
+    parser.add_argument("--imagenet",default="/media/shenberg/ssd_large/imagenet")
+
     parser.add_argument("--coding-loss-beta", type=float, default=0.01, help="constant multiplier for entropy loss")
 
     args = parser.parse_args()
@@ -310,7 +313,7 @@ def main():
     print(encoder)
     use_cuda = torch.cuda.is_available()
     ce_loss = torch.nn.CrossEntropyLoss()
-    ssim_loss = SSIM()
+    ssim_loss = MS_SSIM(mode='sum')
     # TODO: proper MS-SSIM
     mse_loss = torch.nn.MSELoss()
     if use_cuda:
@@ -329,16 +332,20 @@ def main():
     # pre-processing transform
     # augmentation goes here, e.g. RandomResizedCrop instead of regular random crop
     transform = torchvision.transforms.Compose([
-        #torchvision.transforms.RandomCrop(args.image_size),
-        torchvision.transforms.RandomResizedCrop(args.image_size),
+        torchvision.transforms.RandomCrop(args.image_size, pad_if_needed=True),
+        #torchvision.transforms.RandomResizedCrop(args.image_size),
         torchvision.transforms.RandomHorizontalFlip(),
         torchvision.transforms.ToTensor(),
         #torchvision.transforms.Lambda(lambda x: (x - 0.5) * 2) # convert pixel values from 0..1 to -1..1
         ])
 
 
-
-    train_dataset = EagerFolder(args.data_dir, transform=transform)
+    if args.imagenet:
+        print("loading imagenet")
+        train_dataset = torchvision.datasets.ImageFolder(args.imagenet, transform=transform)
+        print("loaded")
+    else:
+        train_dataset = EagerFolder(args.data_dir, transform=transform)
     train_gen = torch.utils.data.DataLoader(train_dataset, args.batch_size, shuffle=True,
                                             pin_memory=use_cuda, num_workers=3)
     #if use_cuda:
@@ -386,8 +393,9 @@ def main():
 
         decoded = decoder(quantized)
             
-        loss = mse_loss(decoded, real_data_v)
-
+        #loss = mse_loss(decoded, real_data_v)
+        loss = 1 - ssim_loss(decoded, real_data_v)
+        #raise Exception('delete me')
             # if args.orthoreg_loss: 
             #     ortho_loss_d[0] = 0
             #     ortho_loss_v = autograd.Variable(ortho_loss_d)
