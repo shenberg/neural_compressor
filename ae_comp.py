@@ -88,7 +88,7 @@ def downscale(in_channels, out_channels):
             nn.ReLU(inplace=True),]
 
 class ResNetEncoder(nn.Module):
-    def __init__(self, latent_dim, res_blocks=5, depth=3, conv=nn.Conv2d):
+    def __init__(self, latent_dim, psp=False, res_blocks=5, depth=3, conv=nn.Conv2d):
         super().__init__()
         self.input_transform = nn.Sequential(
             #*(downscale(3, 64) + downscale(64, 128)
@@ -106,6 +106,9 @@ class ResNetEncoder(nn.Module):
         blocks = [ResBlock(128, 128, functools.partial(resnet_block, depth=depth, conv=conv)) \
                     for i in range(res_blocks)]
         self.main = nn.Sequential(*blocks)
+        self.use_psp = psp
+        if self.use_psp:
+            self.psp = PSPModule(128, 128) #TODO: games
         # In paper, this:
         #self.final = conv(128, latent_dim, kernel_size=5, padding=2, stride=2, bias=True)
         self.final = nn.Conv2d(128, latent_dim, kernel_size=4, padding=1, stride=2, bias=True)
@@ -119,6 +122,8 @@ class ResNetEncoder(nn.Module):
     def forward(self, x):
         h = self.input_transform(x)
         h = self.main(h)
+        if self.use_psp:
+            h = self.psp(h)
         h = self.final(h)
         return h
 
@@ -271,23 +276,26 @@ class ContextModel(nn.Module):
         h = h + self.main(h)
         return self.output(h)
 
+
+
 #decoded, real_data_v = 0, 0
 def main():
     #global decoded, real_data_v
     parser = argparse.ArgumentParser(description="options")
     parser.add_argument("-o", "--output-base-dir", default="/mnt/7FC1A7CD7234342C/compression-results/")
-    parser.add_argument("-lr", "--learning-rate", type=float, default=4e-3)
+    parser.add_argument("-lr", "--learning-rate", type=float, default=1e-4)
     parser.add_argument("--data-dir", default="/mnt/7FC1A7CD7234342C/compression/dataset", help="path to image dataset")
     parser.add_argument("--dim", type=int, default=64, help="base dimension for generator")
-    parser.add_argument("--latent-dim", type=int, default=64, help="latent dimension for autoencoder")
+    parser.add_argument("--latent-dim", type=int, default=16, help="latent dimension for autoencoder")
     parser.add_argument("--num-centers", type=int, default=8, help="number of centers for quantization")
     parser.add_argument("--batch-size", type=int, default=32, help="batch size. Bigger is better, limit is RAM")
     parser.add_argument("--iterations", type=int, default=100000, help="generator iterations")
     parser.add_argument("--lr-decay-iters", type=int, default=10000, help="time till decay")
     parser.add_argument("--image-size", type=int, default=176, help="image size (one side, default 64)")
-    parser.add_argument("--context-learning-rate", type=float, default=1e-4)
+    parser.add_argument("--context-learning-rate", type=float, default=5e-5)
     parser.add_argument("--weight-decay", type=float, default=1e-6)
     parser.add_argument("--imagenet",default="/media/shenberg/ssd_large/imagenet")
+    parser.add_argument("--no-psp",dest='psp',action='store_false')
 
     parser.add_argument("--coding-loss-beta", type=float, default=0.01, help="constant multiplier for entropy loss")
 
@@ -331,6 +339,8 @@ def main():
     beta = args.coding_loss_beta
     # pre-processing transform
     # augmentation goes here, e.g. RandomResizedCrop instead of regular random crop
+    # NOTE: pad_if_needed added manually since it was only added to torchvision on 6/4/18
+    #       and is not yet released
     transform = torchvision.transforms.Compose([
         torchvision.transforms.RandomCrop(args.image_size, pad_if_needed=True),
         #torchvision.transforms.RandomResizedCrop(args.image_size),
