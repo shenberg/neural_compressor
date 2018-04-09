@@ -227,6 +227,62 @@ class SoftToHardEncoder(nn.Module):
         #j = L2_dist(z[:,None],W[None,:]).sum(2).min(1)[1]
         return soft_symbols, hard_symbols, idxes
 
+# Encode Nd samples, separate encoder per channel
+class SoftToHardNdEncoder(nn.Module):
+    def __init__(self, num_codes, latent_dim, channel_dim):
+        super().__init__()
+        # centers - each row represents the centers for a channel
+        # each column is a specific center
+        self.codes = nn.Parameter(torch.Tensor(latent_dim, num_codes, channel_dim))
+        self.codes.data.normal_(0, 1)
+        self.num_codes = num_codes
+        self.latent_dim = latent_dim
+        self.channel_dim = channel_dim
+
+        self.softmin = nn.Softmin(dim=4) # intended to work on BxHxWxCxnum_codes matrices
+
+    def forward(self, z):
+        h = z
+        # BCWH -> BWHC
+        h = h.permute(0,2,3,1)
+        batch, width, height, channels = h.size()
+        h = h.contiguous()
+        h = h.view(batch, width, height, channels // self.channel_dim, self.channel_dim)
+
+        # change W to 1x1x1xCxnum_codesxcode_dim to get desired broadcast behavior
+        W = self.codes[None,None,None]
+        # duplicate each channel vector num_codes times
+        # so we can get the distance between each vector and its codes
+        # so now BxWxHxCxnum_codesxchannel_dim matrix
+        expanded = h[:,:,:,:,None,:].expand(
+            (batch, width, height, channels // self.channel_dim, self.num_codes, self.channel_dim)
+        )
+        # last dim is vector - code for each vector in each channel
+        distances = (expanded - W).norm(p=2, dim=5)
+
+        symbol_probs = self.softmin(distances)
+        # sum of symbols weighted by their odds
+        # now we have a BWHC matrix again
+        
+        soft_symbols = (symbol_probs.unsqueeze(-1) * W).sum(dim=4)
+
+        # Get the index of the center chosen per channel
+        # BxWxHxCxnum_codes -> BWHC
+        idxes = distances.min(dim=4)[1] 
+        # calculate row offset for each channel for lookup into dictionary
+        # TODO: cuda hack
+        offsets = autograd.Variable(torch.arange(0, self.latent_dim * self.num_codes, self.num_codes,
+                    out=torch.cuda.LongTensor((1,1,1,self.latent_dim))))
+
+        flat_indexes = (idxes + offsets).view(-1)
+        flat_symbols = W.view(-1, self.channel_dim)
+        # take the corresponding center from each channel
+        hard_symbols_flat = flat_symbols.index_select(0, flat_indexes)
+        hard_symbols = hard_symbols_flat.view(batch, width, height, channels)
+        #j = L2_dist(z[:,None],W[None,:]).sum(2).min(1)[1]
+        return soft_symbols.view(batch, width, height, channels), hard_symbols, idxes
+
+
 
 # TODO: implement as kernel_size / 2 with one-sided padding
 class MaskedConv3d(nn.Conv3d):
@@ -251,10 +307,12 @@ class MaskedConv3d(nn.Conv3d):
 
 
 class ContextModel(nn.Module):
-    def __init__(self, centers, channels=24, kernel_size=3):
+    def __init__(self, centers, vq_dim, channels=24):
         super().__init__()
+        self.centers = centers
+        self.vq_dim = vq_dim
         self.initial = nn.Sequential(
-            MaskedConv3d('A', 1, channels, kernel_size=3, padding=1),
+            MaskedConv3d('A', vq_dim, channels, kernel_size=3, padding=1),
             nn.ReLU(inplace=True)
             )
         self.main = nn.Sequential(
@@ -263,6 +321,7 @@ class ContextModel(nn.Module):
             MaskedConv3d('B', channels, channels, kernel_size=3, padding=1),
             nn.ReLU(inplace=True)
             )
+
         # In paper:
         self.output = nn.Sequential(
             MaskedConv3d('B', channels, centers, kernel_size=3, padding=1),
@@ -272,10 +331,11 @@ class ContextModel(nn.Module):
         #self.output = MaskedConv3d('B', channels, centers, kernel_size=3, padding=1)
 
     def forward(self, x):
-        h = self.initial(x[:,None])
+        as_3d = x[:,None]
+        as_3d = x.view(x.size(0), self.vq_dim, x.size(1) // self.vq_dim, x.size(2), x.size(3))
+        h = self.initial(as_3d)
         h = h + self.main(h)
         return self.output(h)
-
 
 
 #decoded, real_data_v = 0, 0
@@ -286,18 +346,20 @@ def main():
     parser.add_argument("-lr", "--learning-rate", type=float, default=1e-4)
     parser.add_argument("--data-dir", default="/mnt/7FC1A7CD7234342C/compression/dataset", help="path to image dataset")
     parser.add_argument("--dim", type=int, default=64, help="base dimension for generator")
-    parser.add_argument("--latent-dim", type=int, default=16, help="latent dimension for autoencoder")
+    #TODO: best setting: 16
+    parser.add_argument("--latent-dim", type=int, default=128, help="latent dimension for autoencoder")
     parser.add_argument("--num-centers", type=int, default=8, help="number of centers for quantization")
     parser.add_argument("--batch-size", type=int, default=32, help="batch size. Bigger is better, limit is RAM")
-    parser.add_argument("--iterations", type=int, default=100000, help="generator iterations")
-    parser.add_argument("--lr-decay-iters", type=int, default=10000, help="time till decay")
+    parser.add_argument("--iterations", type=int, default=240000, help="generator iterations")
+    parser.add_argument("--lr-decay-iters", type=int, default=80000, help="time till decay")
     parser.add_argument("--image-size", type=int, default=176, help="image size (one side, default 64)")
-    parser.add_argument("--context-learning-rate", type=float, default=5e-5)
+    parser.add_argument("--context-learning-rate", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-6)
     parser.add_argument("--imagenet",default="/media/shenberg/ssd_large/imagenet")
     parser.add_argument("--no-psp",dest='psp',action='store_false')
+    parser.add_argument("--vq-dim", type=int, default=8)
 
-    parser.add_argument("--coding-loss-beta", type=float, default=0.01, help="constant multiplier for entropy loss")
+    parser.add_argument("--coding-loss-beta", type=float, default=0.05, help="constant multiplier for entropy loss")
 
     args = parser.parse_args()
 
@@ -312,16 +374,22 @@ def main():
 
     encoder = ResNetEncoder(latent_dim=args.latent_dim)
     decoder = ResNetDecoder(latent_dim=args.latent_dim)
-    quantizer = SoftToHardEncoder(num_codes=args.num_centers, latent_dim=args.latent_dim)
-    context_model = ContextModel(args.num_centers)
+    # TODO: toggle
+    #quantizer = SoftToHardEncoder(num_codes=args.num_centers, latent_dim=args.latent_dim)
+    quantizer = SoftToHardNdEncoder(num_codes=args.num_centers, 
+                                    latent_dim=args.latent_dim // args.vq_dim, 
+                                    channel_dim = args.vq_dim)
+    context_model = ContextModel(args.num_centers, args.vq_dim)
 
     decoder.apply(weights_init)
     encoder.apply(weights_init)
     print(decoder)
     print(encoder)
+    print(context_model)
     use_cuda = torch.cuda.is_available()
     ce_loss = torch.nn.CrossEntropyLoss()
-    ssim_loss = MS_SSIM(mode='sum')
+    #ssim_loss = MS_SSIM(mode='sum')
+    ssim_loss = MS_SSIM(mode='product')
     # TODO: proper MS-SSIM
     mse_loss = torch.nn.MSELoss()
     if use_cuda:
@@ -396,15 +464,23 @@ def main():
 
         quantized = (hard - soft).detach() + soft # use soft symbol for backprop
         #TODO: move into quantizer
-        quantized = quantized.permute(0,3,1,2)
+        quantized = quantized.permute(0,3,1,2).contiguous()
+        #quantized = quantized.permute(0,3,1,2).contiguous()
+
+        #symbols = symbols.permute(0,3,1,2).contiguous()
 
         predictions = context_model(quantized)
+        #print(symbols.size(), predictions.size())
+
+        #coding_loss = ce_loss(predictions.view(-1, args.num_centers), 
+        #                      symbols.view(-1))
         coding_loss = ce_loss(predictions, symbols.permute(0,3,1,2))
 
         decoded = decoder(quantized)
             
         #loss = mse_loss(decoded, real_data_v)
-        loss = 1 - ssim_loss(decoded, real_data_v)
+        ssim = ssim_loss(decoded, real_data_v)
+        loss = 1 - ssim
         #raise Exception('delete me')
             # if args.orthoreg_loss: 
             #     ortho_loss_d[0] = 0
@@ -413,6 +489,7 @@ def main():
             #     loss += ortho_loss_v
 
         (loss + beta*coding_loss).backward()
+        #(-ssim*(7 - coding_loss)).backward()
         optimizer.step()
         optimizer_context.step()
         scheduler.step()

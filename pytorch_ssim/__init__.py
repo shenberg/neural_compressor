@@ -32,7 +32,7 @@ def _ssim(img1, img2, window, window_size, channel, max_val=255.0):
     C1 = (0.01*max_val)**2
     C2 = (0.03*max_val)**2
 
-    v1 = 2.0*sigma12 + C2
+    v1 = F.relu(2.0*sigma12, inplace=True) + C2
     v2 = sigma1_sq + sigma2_sq + C2
 
     # luminosity * contrast * similarity
@@ -90,6 +90,8 @@ class MS_SSIM(torch.nn.Module):
             csses.append(cs)
             img1 = self.downscale(img1)
             img2 = self.downscale(img2)
+        #print(img1)
+        #print(img2)
         #print(csses)
         #print(ssim)
         result_array = torch.stack(csses[:-1] + [ssim], dim=1)
