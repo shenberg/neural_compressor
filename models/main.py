@@ -301,7 +301,7 @@ class PSPModule(nn.Module):
         self.stages = []
         self.stages = nn.ModuleList([self._make_stage(features, size) for size in sizes])
         self.bottleneck = nn.Conv2d(features * (len(sizes) + 1), out_features, kernel_size=1)
-        self.relu = nn.ReLU()
+        self.relu = nn.ReLU(inplace=True)
 
     def _make_stage(self, features, size):
         prior = nn.AdaptiveAvgPool2d(output_size=(size, size))
