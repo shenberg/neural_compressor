@@ -21,7 +21,8 @@ import tflib.plot
 import numpy as np
 from tqdm import tqdm
 
-from models.autoencoder import ContextModel, SoftToHardNdEncoder, ResNetEncoder, ResNetDecoder
+from models.autoencoder import ContextModel, ContextModelMultilayered, SoftToHardNdEncoder, \
+                                ResNetEncoder, ResNetDecoder, ResNetMultiscaleEncoder
 
 from utils import EagerFolder, save_images
 #import orthoreg
@@ -60,21 +61,21 @@ def main():
     parser.add_argument("-o", "--output-base-dir", default="/mnt/7FC1A7CD7234342C/compression-results/")
     parser.add_argument("-lr", "--learning-rate", type=float, default=1e-4)
     parser.add_argument("--data-dir", default="/mnt/7FC1A7CD7234342C/compression/dataset", help="path to image dataset")
-    parser.add_argument("--dim", type=int, default=64, help="base dimension for generator")
     #TODO: best setting: 16
     parser.add_argument("--latent-dim", type=int, default=128, help="latent dimension for autoencoder")
     parser.add_argument("--num-centers", type=int, default=8, help="number of centers for quantization")
     parser.add_argument("--batch-size", type=int, default=32, help="batch size. Bigger is better, limit is RAM")
     parser.add_argument("--iterations", type=int, default=240000, help="generator iterations")
     parser.add_argument("--lr-decay-iters", type=int, default=80000, help="time till decay")
-    parser.add_argument("--image-size", type=int, default=176, help="image size (one side, default 64)")
+    parser.add_argument("--image-size", type=int, default=192, help="image size (one side, default 64)")
     parser.add_argument("--context-learning-rate", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-6)
     parser.add_argument("--imagenet",default="/media/shenberg/ssd_large/imagenet")
     parser.add_argument("--no-psp",dest='psp',action='store_false')
     parser.add_argument("--vq-dim", type=int, default=8)
-
-    parser.add_argument("--coding-loss-beta", type=float, default=0.05, help="constant multiplier for entropy loss")
+    parser.add_argument("--use-layered-context",action="store_true")
+    parser.add_argument("--use-multiscale-resnet",action="store_true")
+    parser.add_argument("--coding-loss-beta", type=float, default=0.2, help="constant multiplier for entropy loss")
 
     args = parser.parse_args()
 
@@ -87,20 +88,27 @@ def main():
         import json
         json.dump(vars(args), f, indent=2)
 
-    encoder = ResNetEncoder(latent_dim=args.latent_dim)
+    if not args.use_multiscale_resnet:
+        encoder = ResNetEncoder(latent_dim=args.latent_dim)
+    else:
+        encoder = ResNetMultiscaleEncoder(latent_dim=args.latent_dim)
+
     decoder = ResNetDecoder(latent_dim=args.latent_dim)
     # TODO: toggle
     #quantizer = SoftToHardEncoder(num_codes=args.num_centers, latent_dim=args.latent_dim)
     quantizer = SoftToHardNdEncoder(num_codes=args.num_centers, 
                                     latent_dim=args.latent_dim // args.vq_dim, 
                                     channel_dim = args.vq_dim)
-    context_model = ContextModel(args.num_centers, args.vq_dim)
+    if not args.use_layered_context:
+        context_model = ContextModel(args.num_centers, args.vq_dim)
+    else:
+        context_model = ContextModelMultilayered(args.num_centers, args.vq_dim, args.latent_dim // args.vq_dim)
 
     decoder.apply(weights_init)
     encoder.apply(weights_init)
-    print(decoder)
-    print(encoder)
-    print(context_model)
+    #print(decoder)
+    #print(encoder)
+    #print(context_model)
     use_cuda = torch.cuda.is_available()
     ce_loss = torch.nn.CrossEntropyLoss()
     #ssim_loss = MS_SSIM(mode='sum')
@@ -119,7 +127,7 @@ def main():
         ssim_loss = ssim_loss.cuda(gpu)
         ce_loss = ce_loss.cuda(gpu)
 
-    beta = args.coding_loss_beta
+    beta = args.coding_loss_beta #*(latent_dim // #normalize beta according to bpp
     # pre-processing transform
     # augmentation goes here, e.g. RandomResizedCrop instead of regular random crop
     # NOTE: pad_if_needed added manually since it was only added to torchvision on 6/4/18
@@ -204,7 +212,13 @@ def main():
             #     orthoreg.orthoreg_loss(netD, ortho_loss_v)
             #     loss += ortho_loss_v
 
+        # sorta best-working:
+        #(loss + beta*ssim*coding_loss).backward()
+        # original formulation:
         (loss + beta*coding_loss).backward()
+        #(loss + beta*coding_loss - ssim*coding_loss).backward()
+        
+        #(loss*3*coding_loss.detach() + ssim*coding_loss).backward()
         #(-ssim*(7 - coding_loss)).backward()
         optimizer.step()
         optimizer_context.step()

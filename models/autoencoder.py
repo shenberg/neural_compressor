@@ -80,6 +80,69 @@ class ResNetEncoder(nn.Module):
         h = self.final(h)
         return h
 
+class ResNetMultiscaleEncoder(nn.Module):
+    def __init__(self, latent_dim, psp=False, res_blocks=5, depth=3, conv=nn.Conv2d):
+        super().__init__()
+        self.input_transform = nn.Sequential(
+            #*(downscale(3, 64) + downscale(64, 128)
+            conv(3, 64, kernel_size=3, padding=1, stride=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            conv(64, 64, kernel_size=4, padding=1, stride=2, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            conv(64, 128, kernel_size=4, padding=1, stride=2, bias=False),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            )
+
+        blocks = [ResBlock(128, 128, functools.partial(resnet_block, depth=depth, conv=conv)) \
+                    for i in range(res_blocks)]
+        self.resblock_pre = blocks[0]
+        self.resblock_post1 = blocks[1]
+        self.resblock_post2 = blocks[2]
+        self.resblock_d1 = blocks[3]
+        self.resblock_d2 = blocks[4]
+        self.ds1 = nn.Sequential(
+            conv(128, 128, kernel_size=4, padding=1, stride=2, bias=False),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True)
+            )
+        self.ds2 = nn.Sequential(
+            conv(128, 128, kernel_size=4, padding=1, stride=2, bias=False),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True)
+            )
+        self.us1 = nn.Sequential(*_upscale_resize(128, 128, 3))
+        self.us2 = nn.Sequential(*_upscale_resize(128, 128, 3))
+        self.use_psp = psp
+        if self.use_psp:
+            self.psp = PSPModule(128, 128) #TODO: games
+        # In paper, this:
+        #self.final = conv(128, latent_dim, kernel_size=5, padding=2, stride=2, bias=True)
+        self.final = nn.Conv2d(128, latent_dim, kernel_size=4, padding=1, stride=2, bias=True)
+        # but details imply this:
+        # self.final = nn.Sequential(
+        #             conv(128, latent_dim, kernel_size=5, padding=2, stride=2, bias=True),
+        #             # TODO: test BN here too
+        #             nn.ReLU(inplace=True),
+        #             )
+
+    def forward(self, x):
+        h = self.input_transform(x)
+        h = self.resblock_pre(h)
+        h_d1 = self.ds1(h)
+        h_d2 = self.ds2(h_d1)
+        h_d2 = self.resblock_d1(h_d2)
+        h_d1 = self.resblock_d2(h_d1 + self.us2(h_d2))
+        h = self.resblock_post1(h + self.us1(h_d1))
+        h = self.resblock_post2(h)
+        if self.use_psp:
+            h = self.psp(h)
+        h = self.final(h)
+        return h
+
+
 def _upscale_resize(in_dim, out_dim, kernel_size):
     pad1, pad2 = (kernel_size - 1) // 2, kernel_size // 2
 
@@ -173,12 +236,17 @@ class SoftToHardEncoder(nn.Module):
         idxes = distances.min(dim=4)[1] 
         # calculate row offset for each channel for lookup into dictionary
         # TODO: cuda hack
+        if idxes.is_cuda:
+            output = torch.cuda.LongTensor((1,1,1,self.latent_dim))
+        else:
+            output = torch.LongTensor((1,1,1,self.latent_dim))
         offsets = autograd.Variable(torch.arange(0, self.latent_dim * self.num_codes, self.num_codes,
-                    out=torch.cuda.LongTensor((1,1,1,self.latent_dim))))
+                    out=output))
         # take the corresponding center from each channel
         hard_symbols = W.take(idxes + offsets)
         #j = L2_dist(z[:,None],W[None,:]).sum(2).min(1)[1]
         return soft_symbols, hard_symbols, idxes
+
 
 # Encode Nd samples, separate encoder per channel
 class SoftToHardNdEncoder(nn.Module):
@@ -196,11 +264,11 @@ class SoftToHardNdEncoder(nn.Module):
 
     def forward(self, z):
         h = z
-        # BCWH -> BWHC
+        # BCWH -> BHWC
         h = h.permute(0,2,3,1)
-        batch, width, height, channels = h.size()
+        batch, height, width, channels = h.size()
         h = h.contiguous()
-        h = h.view(batch, width, height, channels // self.channel_dim, self.channel_dim)
+        h = h.view(batch, height, width, channels // self.channel_dim, self.channel_dim)
 
         # change W to 1x1x1xCxnum_codesxcode_dim to get desired broadcast behavior
         W = self.codes[None,None,None]
@@ -208,32 +276,38 @@ class SoftToHardNdEncoder(nn.Module):
         # so we can get the distance between each vector and its codes
         # so now BxWxHxCxnum_codesxchannel_dim matrix
         expanded = h[:,:,:,:,None,:].expand(
-            (batch, width, height, channels // self.channel_dim, self.num_codes, self.channel_dim)
+            (batch, height, width, channels // self.channel_dim, self.num_codes, self.channel_dim)
         )
         # last dim is vector - code for each vector in each channel
         distances = (expanded - W).norm(p=2, dim=5)
 
         symbol_probs = self.softmin(distances)
         # sum of symbols weighted by their odds
-        # now we have a BWHC matrix again
+        # now we have a BHWC matrix again
         
         soft_symbols = (symbol_probs.unsqueeze(-1) * W).sum(dim=4)
 
         # Get the index of the center chosen per channel
-        # BxWxHxCxnum_codes -> BWHC
+        # BxHxWxCxnum_codes -> BHWC
         idxes = distances.min(dim=4)[1] 
         # calculate row offset for each channel for lookup into dictionary
         # TODO: cuda hack
+        if idxes.is_cuda:
+            output = torch.cuda.LongTensor((1,1,1,self.latent_dim))
+        else:
+            output = torch.LongTensor((1,1,1,self.latent_dim))
+
         offsets = autograd.Variable(torch.arange(0, self.latent_dim * self.num_codes, self.num_codes,
-                    out=torch.cuda.LongTensor((1,1,1,self.latent_dim))))
+                    out=output),
+                    volatile=z.volatile)
 
         flat_indexes = (idxes + offsets).view(-1)
         flat_symbols = W.view(-1, self.channel_dim)
         # take the corresponding center from each channel
         hard_symbols_flat = flat_symbols.index_select(0, flat_indexes)
-        hard_symbols = hard_symbols_flat.view(batch, width, height, channels)
+        hard_symbols = hard_symbols_flat.view(batch, height, width, channels)
         #j = L2_dist(z[:,None],W[None,:]).sum(2).min(1)[1]
-        return soft_symbols.view(batch, width, height, channels), hard_symbols, idxes
+        return soft_symbols.view(batch, height, width, channels), hard_symbols, idxes
 
 
 # TODO: implement as kernel_size / 2 with one-sided padding
@@ -283,8 +357,79 @@ class ContextModel(nn.Module):
         #self.output = MaskedConv3d('B', channels, centers, kernel_size=3, padding=1)
 
     def forward(self, x):
-        as_3d = x[:,None]
-        as_3d = x.view(x.size(0), self.vq_dim, x.size(1) // self.vq_dim, x.size(2), x.size(3))
-        h = self.initial(as_3d)
+        if len(x.size()) == 4:
+            as_3d = x[:,None]
+            as_3d = x.view(x.size(0), x.size(1) // self.vq_dim, self.vq_dim, x.size(2), x.size(3))
+            x = as_3d.transpose(1, 2)
+        return self.forward_3d(x)
+
+    def forward_3d(self, x_3d):
+        h = self.initial(x_3d)
         h = h + self.main(h)
         return self.output(h)
+
+# TODO: implement as kernel_size / 2 with one-sided padding
+class ChannelMaskedConv2d(nn.Conv2d):
+    def __init__(self, mask_type, mask_start, *args, **kwargs):
+        super(ChannelMaskedConv2d, self).__init__(*args, **kwargs)
+        assert mask_type in {'A', 'B'}
+        self.register_buffer('mask', self.weight.data.clone())
+        _, _, kH, kW = self.weight.size()
+        self.mask.fill_(1)
+        # fill bottom half of slice with 0s (Y points down)
+        self.mask[:, mask_start:, kH // 2 + 1:] = 0
+        # for middle row, fill end of row with 0s
+        # NOTE: first layer must have mask type 'A', which zeros out the middle weight too
+        #       this is because to predict the voxel we must not use the input as a value
+        self.mask[:, mask_start:, kH // 2, kW // 2 + (mask_type == 'B'):] = 0
+
+    def forward(self, x):
+        self.weight.data *= self.mask
+        return super(ChannelMaskedConv2d, self).forward(x)
+
+
+class ContextModel2d(nn.Module):
+    def __init__(self, centers, vq_dim, in_channels, channels=24):
+        super().__init__()
+        self.centers = centers
+        self.vq_dim = vq_dim
+        self.initial = nn.Sequential(
+            ChannelMaskedConv2d('A', in_channels - vq_dim, in_channels, channels, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True)
+            )
+        self.main = nn.Sequential(
+            ChannelMaskedConv2d('B', 0, channels, channels, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            ChannelMaskedConv2d('B', 0, channels, channels, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True)
+            )
+
+        # In paper:
+        self.output = nn.Sequential(
+            ChannelMaskedConv2d('B', 0, channels, centers, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True)
+            )
+        # ReLU shouldn't matter, or should make things worse. But it does?
+        #self.output = ChannelMaskedConv2d('B', 0, channels, centers, kernel_size=3, padding=1)
+
+    def forward(self, x):
+        h = self.initial(x)
+        h = h + self.main(h)
+        return self.output(h)
+
+class ContextModelMultilayered(nn.Module):
+    def __init__(self, centers, vq_dim, layers):
+        super().__init__()
+        self.models = nn.ModuleList([
+            ContextModel2d(centers, vq_dim, (i+1)*vq_dim) 
+                for i in range(layers)
+            ])
+        self.vq_dim = vq_dim
+
+    def forward(self, x):
+        results = []
+        for i, model in enumerate(self.models):
+            results.append(model(x[:,:(i+1)*self.vq_dim]))
+        # each result is Bxnum_centersxHxW
+        # turn into Bxnum_centersxlayersxHxW
+        return torch.stack(results, dim=2)
