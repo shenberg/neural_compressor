@@ -181,8 +181,8 @@ def MultiScaleSSIM(img1,
             for im in [im1, im2]
         ]
         im1, im2 = [x[:, ::2, ::2, :] for x in filtered]
-    print(mcs)
-    print(mssim)
+    #print(mcs)
+    #print(mssim)
     return (np.prod(mcs[0:levels - 1]**weights[0:levels - 1]) *
             (mssim[levels - 1]**weights[levels - 1]))
 
