@@ -2,6 +2,11 @@
 *.sym
 *.enc
 *.pth
+*.lat
+*.pcm
+*.syms
+*.ps
+*.probs
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
