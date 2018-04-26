@@ -1,4 +1,7 @@
-
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from collections import OrderedDict
 
 class _DenseLayer(nn.Sequential):
     def __init__(self, num_input_features, growth_rate, bn_size, drop_rate):
@@ -37,8 +40,8 @@ class _Transition(nn.Sequential):
                                           kernel_size=1, stride=1, bias=False))
         if downsample:
             self.add_module('pool', nn.AvgPool2d(kernel_size=2, stride=2))
-        else:
-            self.add_module('pool', nn.AvgPool2d(kernel_size=1, stride=1))  # compatibility hack
+        #else:
+        #    self.add_module('pool', nn.AvgPool2d(kernel_size=1, stride=1))  # compatibility hack
 
 
 class DenseNet(nn.Module):

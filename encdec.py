@@ -288,7 +288,9 @@ def decode(src_path, decoder, quantizer, context_model):
     decoded_image = decoder(decoded_latent).data[0]
     if (decoded_image.size(1) != output_height) or (decoded_image.size(2) != output_width):
         pad_x, pad_y = calculate_padding(output_width, output_height)
-        return decoded_image[:,(pad_y + 1) // 2:-(pad_y // 2), (pad_x + 1) // 2:-(pad_x // 2)]
+        return decoded_image[:, \
+                        (pad_y + 1) // 2 : decoded_image.size(1) - (pad_y // 2), \
+                        (pad_x + 1) // 2 : decoded_image.size(2) - (pad_x // 2)]
     else:
         return decoded_image
 

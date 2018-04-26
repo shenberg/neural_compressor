@@ -22,7 +22,8 @@ import numpy as np
 from tqdm import tqdm
 
 from models.autoencoder import ContextModel, ContextModelMultilayered, SoftToHardNdEncoder, \
-                                ResNetEncoder, ResNetDecoder, ResNetMultiscaleEncoder
+                                ResNetEncoder, ResNetDecoder, ResNetMultiscaleEncoder, DenseEncoder, \
+                                LayerDropout2d
 
 from utils import EagerFolder, save_images
 #import orthoreg
@@ -69,13 +70,17 @@ def main():
     parser.add_argument("--lr-decay-iters", type=int, default=80000, help="time till decay")
     parser.add_argument("--image-size", type=int, default=192, help="image size (one side, default 64)")
     parser.add_argument("--context-learning-rate", type=float, default=1e-4)
-    parser.add_argument("--weight-decay", type=float, default=1e-6)
+    parser.add_argument("--weight-decay", type=float, default=5e-7)
     parser.add_argument("--imagenet",default="/media/shenberg/ssd_large/imagenet")
     parser.add_argument("--no-psp",dest='psp',action='store_false')
     parser.add_argument("--vq-dim", type=int, default=8)
     parser.add_argument("--use-layered-context",action="store_true")
     parser.add_argument("--use-multiscale-resnet",action="store_true")
-    parser.add_argument("--coding-loss-beta", type=float, default=0.2, help="constant multiplier for entropy loss")
+    parser.add_argument("--use-densenet",action="store_true")
+    parser.add_argument("--coding-loss-beta", type=float, default=0.1, help="constant multiplier for entropy loss")
+    parser.add_argument("--dropout-factor", type=float, default=0.66)
+    parser.add_argument("--use-dropout", action="store_true")
+    aprser.add_argument("--no-context",dest="use_context",action="store_false")
 
     args = parser.parse_args()
 
@@ -88,10 +93,12 @@ def main():
         import json
         json.dump(vars(args), f, indent=2)
 
-    if not args.use_multiscale_resnet:
-        encoder = ResNetEncoder(latent_dim=args.latent_dim)
-    else:
+    if args.use_multiscale_resnet:
         encoder = ResNetMultiscaleEncoder(latent_dim=args.latent_dim)
+    elif args.use_densenet:
+        encoder = DenseEncoder(latent_dim=args.latent_dim)
+    else:
+        encoder = ResNetEncoder(latent_dim=args.latent_dim)
 
     decoder = ResNetDecoder(latent_dim=args.latent_dim)
     # TODO: toggle
@@ -103,6 +110,8 @@ def main():
         context_model = ContextModel(args.num_centers, args.vq_dim)
     else:
         context_model = ContextModelMultilayered(args.num_centers, args.vq_dim, args.latent_dim // args.vq_dim)
+
+    dropout = LayerDropout2d(args.dropout_factor, args.vq_dim)
 
     decoder.apply(weights_init)
     encoder.apply(weights_init)
@@ -126,6 +135,7 @@ def main():
         mse_loss = mse_loss.cuda(gpu)
         ssim_loss = ssim_loss.cuda(gpu)
         ce_loss = ce_loss.cuda(gpu)
+        dropout = dropout.cuda(gpu)
 
     beta = args.coding_loss_beta #*(latent_dim // #normalize beta according to bpp
     # pre-processing transform
@@ -169,6 +179,7 @@ def main():
     gen = inf_train_gen(train_gen)
     #torch.set_default_tensor_type('torch.HalfTensor')
     loss = 0
+    coding_loss = torch.autograd.Variable(torch.zeros(1)) #TODO:remove
     for iteration in tqdm(range(args.iterations)):
 
         start_time = time.time()
@@ -193,12 +204,16 @@ def main():
 
         #symbols = symbols.permute(0,3,1,2).contiguous()
 
-        predictions = context_model(quantized)
-        #print(symbols.size(), predictions.size())
+        #TODO: re-enable
+        if args.use_context:
+            predictions = context_model(quantized)
+            #print(symbols.size(), predictions.size())
 
-        #coding_loss = ce_loss(predictions.view(-1, args.num_centers), 
-        #                      symbols.view(-1))
-        coding_loss = ce_loss(predictions, symbols.permute(0,3,1,2))
+            #coding_loss = ce_loss(predictions.view(-1, args.num_centers), 
+            #                      symbols.view(-1))
+            coding_loss = ce_loss(predictions, symbols.permute(0,3,1,2))
+        if args.use_dropout:
+            quantized = dropout(quantized)
 
         decoded = decoder(quantized)
             
@@ -211,11 +226,13 @@ def main():
             #     ortho_loss_v = autograd.Variable(ortho_loss_d)
             #     orthoreg.orthoreg_loss(netD, ortho_loss_v)
             #     loss += ortho_loss_v
-
-        # sorta best-working:
-        #(loss + beta*ssim*coding_loss).backward()
-        # original formulation:
-        (loss + beta*coding_loss).backward()
+        if args.use_context:
+            # sorta best-working:
+            #(loss + beta*ssim*coding_loss).backward()
+            # original formulation:
+            (loss + beta*coding_loss).backward()
+        else:
+            loss.backward()
         #(loss + beta*coding_loss - ssim*coding_loss).backward()
         
         #(loss*3*coding_loss.detach() + ssim*coding_loss).backward()

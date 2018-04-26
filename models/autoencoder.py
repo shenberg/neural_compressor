@@ -2,8 +2,10 @@ import functools
 import torch
 import torch.nn as nn
 import torch.autograd as autograd
+from collections import OrderedDict
 
 from .main import PSPModule
+from .densenet import _DenseBlock, _Transition
 
 def plain_res_block(in_dim, out_dim, conv):
     return nn.Sequential(
@@ -433,3 +435,62 @@ class ContextModelMultilayered(nn.Module):
         # each result is Bxnum_centersxHxW
         # turn into Bxnum_centersxlayersxHxW
         return torch.stack(results, dim=2)
+
+
+
+class DenseEncoder(nn.Module):
+    "differences from densenet: learned downscale instead of max pooling"
+    def __init__(self, latent_dim, growth_rate=32, block_config=(6, 6, 6),
+                 num_init_features=64, bn_size=4, drop_rate=0):
+        super(DenseEncoder, self).__init__()
+
+        # First convolution
+        self.start_features = nn.Sequential(OrderedDict([
+            ('conv0', nn.Conv2d(3, num_init_features // 2, kernel_size=7, stride=2, padding=3, bias=False)),
+            ('norm0', nn.BatchNorm2d(num_init_features // 2)),
+            ('relu0', nn.ReLU(inplace=True)),
+            ('pool0', nn.Conv2d(num_init_features//2, num_init_features, kernel_size=5, stride=2, padding=2)),
+            ('relu1', nn.ReLU(inplace=True)),
+        ]))
+
+        # Each denseblock
+        num_features = num_init_features
+
+        self.blocks = nn.ModuleList()
+        for i, num_layers in enumerate(block_config):
+            block = _DenseBlock(num_layers=num_layers, num_input_features=num_features,
+                                bn_size=bn_size, growth_rate=growth_rate, drop_rate=drop_rate)
+            self.blocks.append(block)
+            setattr(self, 'denseblock%d' % (i + 1), block)
+
+            num_features = num_features + num_layers * growth_rate
+            # downsample transition in the last block
+            #downsample = (i == len(block_config) - 1)
+            downsample = False
+            trans = _Transition(num_input_features=num_features, num_output_features=num_features // 2,
+                                downsample=downsample)
+            self.blocks.append(trans)
+            setattr(self, 'transition%d' % (i + 1), trans)
+            num_features = num_features // 2
+        self.final = nn.Conv2d(num_features, latent_dim, kernel_size=5, stride=2, padding=2)
+
+    def forward(self, x):
+        out = self.start_features(x)
+        for i, block in enumerate(self.blocks):
+            out = block(out)
+
+        #TODO: reenable
+        # return self.final(out)
+        out = self.final(out)
+        return out
+
+class LayerDropout2d(nn.Module):
+    def __init__(self, p, depth):
+        super().__init__()
+        self.depth = depth
+        self.dropout = nn.Dropout2d(p)
+
+    def forward(self, x):
+        b, c, h, w = x.size()
+        out = self.dropout(x.view(b, c // self.depth, h * self.depth, w))
+        return out.view(b, c, h, w)
