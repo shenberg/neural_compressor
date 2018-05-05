@@ -23,7 +23,7 @@ from tqdm import tqdm
 
 from models.autoencoder import ContextModel, ContextModelMultilayered, SoftToHardNdEncoder, \
                                 ResNetEncoder, ResNetDecoder, ResNetMultiscaleEncoder, DenseEncoder, \
-                                LayerDropout2d
+                                LayerDropout2d, SoftToHardVectorEncoder
 
 from utils import EagerFolder, save_images
 #import orthoreg
@@ -60,11 +60,11 @@ def main():
     #global decoded, real_data_v
     parser = argparse.ArgumentParser(description="options")
     parser.add_argument("-o", "--output-base-dir", default="/mnt/7FC1A7CD7234342C/compression-results/")
-    parser.add_argument("-lr", "--learning-rate", type=float, default=1e-4)
+    parser.add_argument("-lr", "--learning-rate", type=float, default=1e-3)
     parser.add_argument("--data-dir", default="/mnt/7FC1A7CD7234342C/compression/dataset", help="path to image dataset")
     #TODO: best setting: 16
     parser.add_argument("--latent-dim", type=int, default=128, help="latent dimension for autoencoder")
-    parser.add_argument("--num-centers", type=int, default=8, help="number of centers for quantization")
+    parser.add_argument("--num-centers", type=int, default=16, help="number of centers for quantization")
     parser.add_argument("--batch-size", type=int, default=32, help="batch size. Bigger is better, limit is RAM")
     parser.add_argument("--iterations", type=int, default=240000, help="generator iterations")
     parser.add_argument("--lr-decay-iters", type=int, default=80000, help="time till decay")
@@ -73,14 +73,18 @@ def main():
     parser.add_argument("--weight-decay", type=float, default=5e-7)
     parser.add_argument("--imagenet",default="/media/shenberg/ssd_large/imagenet")
     parser.add_argument("--no-psp",dest='psp',action='store_false')
-    parser.add_argument("--vq-dim", type=int, default=8)
+    parser.add_argument("--no-decoder-psp",dest='decoder_psp',action='store_false')
+
+    parser.add_argument("--vq-dim", type=int, default=16)
     parser.add_argument("--use-layered-context",action="store_true")
     parser.add_argument("--use-multiscale-resnet",action="store_true")
     parser.add_argument("--use-densenet",action="store_true")
-    parser.add_argument("--coding-loss-beta", type=float, default=0.1, help="constant multiplier for entropy loss")
+    parser.add_argument("--coding-loss-beta", type=float, default=0.01, help="constant multiplier for entropy loss")
     parser.add_argument("--dropout-factor", type=float, default=0.66)
     parser.add_argument("--use-dropout", action="store_true")
-    aprser.add_argument("--no-context",dest="use_context",action="store_false")
+    parser.add_argument("--no-context",dest="use_context",action="store_false")
+    parser.add_argument("--vq-spatial-dim", type=int, default=2)
+    parser.add_argument("--context-smoothing", action="store_true")
 
     args = parser.parse_args()
 
@@ -98,18 +102,24 @@ def main():
     elif args.use_densenet:
         encoder = DenseEncoder(latent_dim=args.latent_dim)
     else:
-        encoder = ResNetEncoder(latent_dim=args.latent_dim)
+        encoder = ResNetEncoder(latent_dim=args.latent_dim, psp=args.psp)
 
-    decoder = ResNetDecoder(latent_dim=args.latent_dim)
+    decoder = ResNetDecoder(latent_dim=args.latent_dim, psp=args.decoder_psp)
     # TODO: toggle
     #quantizer = SoftToHardEncoder(num_codes=args.num_centers, latent_dim=args.latent_dim)
-    quantizer = SoftToHardNdEncoder(num_codes=args.num_centers, 
-                                    latent_dim=args.latent_dim // args.vq_dim, 
-                                    channel_dim = args.vq_dim)
+    if args.vq_spatial_dim == 1:
+        quantizer = SoftToHardNdEncoder(num_codes=args.num_centers, 
+                                        latent_dim=args.latent_dim // args.vq_dim, 
+                                        channel_dim = args.vq_dim)
+    else:
+        quantizer = SoftToHardVectorEncoder(num_codes=args.num_centers, 
+                                        latent_dim=args.latent_dim // args.vq_dim, 
+                                        channel_dim = args.vq_dim,
+                                        xy_size = args.vq_spatial_dim)
     if not args.use_layered_context:
         context_model = ContextModel(args.num_centers, args.vq_dim)
     else:
-        context_model = ContextModelMultilayered(args.num_centers, args.vq_dim, args.latent_dim // args.vq_dim)
+        context_model = ContextModelMultilayered(args.num_centers, args.vq_dim, args.latent_dim // args.vq_dim, args.vq_spatial_dim)
 
     dropout = LayerDropout2d(args.dropout_factor, args.vq_dim)
 
@@ -165,16 +175,18 @@ def main():
 
     optimizer = optim.Adam(list(encoder.parameters()) + list(decoder.parameters())
                          + list(quantizer.parameters()), lr=args.learning_rate, weight_decay=args.weight_decay)
-    optimizer_context = optim.Adam(list(context_model.parameters()),
-                                    lr=args.context_learning_rate, weight_decay=args.weight_decay)
 
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=args.lr_decay_iters)
-    scheduler_context = optim.lr_scheduler.StepLR(optimizer_context, step_size=args.lr_decay_iters)
+
+    if args.use_context:
+        optimizer_context = optim.Adam(list(context_model.parameters()),
+                                        lr=args.context_learning_rate, weight_decay=args.weight_decay)
+        scheduler_context = optim.lr_scheduler.StepLR(optimizer_context, step_size=args.lr_decay_iters)
 
     decoder.train()
     encoder.train()
     quantizer.train()
-    context_model.eval()
+    context_model.train()
 
     gen = inf_train_gen(train_gen)
     #torch.set_default_tensor_type('torch.HalfTensor')
@@ -195,11 +207,11 @@ def main():
 
         encoded = encoder(real_data_v)
 
-        soft, hard, symbols = quantizer(encoded)
+        quantized, symbols = quantizer(encoded)
 
-        quantized = (hard - soft).detach() + soft # use soft symbol for backprop
+
         #TODO: move into quantizer
-        quantized = quantized.permute(0,3,1,2).contiguous()
+        quantized = quantized.contiguous()
         #quantized = quantized.permute(0,3,1,2).contiguous()
 
         #symbols = symbols.permute(0,3,1,2).contiguous()
@@ -207,11 +219,13 @@ def main():
         #TODO: re-enable
         if args.use_context:
             predictions = context_model(quantized)
+            if args.context_smoothing:
+                predictions.mul_(1 - (args.num_centers/1024)).add_(1/1024)
             #print(symbols.size(), predictions.size())
 
             #coding_loss = ce_loss(predictions.view(-1, args.num_centers), 
             #                      symbols.view(-1))
-            coding_loss = ce_loss(predictions, symbols.permute(0,3,1,2))
+            coding_loss = ce_loss(predictions, symbols)
         if args.use_dropout:
             quantized = dropout(quantized)
 
@@ -238,9 +252,10 @@ def main():
         #(loss*3*coding_loss.detach() + ssim*coding_loss).backward()
         #(-ssim*(7 - coding_loss)).backward()
         optimizer.step()
-        optimizer_context.step()
         scheduler.step()
-        scheduler_context.step()
+        if args.use_context:
+            optimizer_context.step()
+            scheduler_context.step()
 
         D_cost = loss.data
 
@@ -291,17 +306,28 @@ def main():
 
         # TODO: argument
         if iteration % 2000 == 1999:
-            state_dict = {
-                        'iters': iteration + 1,
-                        'algo_params': vars(args),
-                        'decoder_dict': decoder.state_dict(),
-                        'encoder_dict': encoder.state_dict(),
-                        'quantizer': quantizer.state_dict(),
-                        'context_model': context_model.state_dict(),
-                        'optimizer' : optimizer.state_dict(),
-                        'optimizer_context' : optimizer_context.state_dict(),
-                    }
-
+            if args.use_context:
+                state_dict = {
+                            'iters': iteration + 1,
+                            'algo_params': vars(args),
+                            'decoder_dict': decoder.state_dict(),
+                            'encoder_dict': encoder.state_dict(),
+                            'quantizer': quantizer.state_dict(),
+                            'context_model': context_model.state_dict(),
+                            'optimizer' : optimizer.state_dict(),
+                            'optimizer_context' : optimizer_context.state_dict(),
+                        }
+            else:
+                state_dict = {
+                            'iters': iteration + 1,
+                            'algo_params': vars(args),
+                            'decoder_dict': decoder.state_dict(),
+                            'encoder_dict': encoder.state_dict(),
+                            'quantizer': quantizer.state_dict(),
+                            'context_model': {},
+                            'optimizer' : optimizer.state_dict(),
+                            'optimizer_context' :  {}
+                            }
             torch.save(state_dict, str(RUN_PATH / 'state_{}.pth.tar'.format(iteration+1)))
 
 if __name__ == "__main__":
