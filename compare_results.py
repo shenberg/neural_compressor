@@ -16,7 +16,7 @@ def compare_dirs(src_dir, enc_dir, dec_dir):
         enc_file = enc_dir / (src_file.with_suffix('.enc').name)
         dec_file = dec_dir / src_file.name
         src_img = Image.open(str(src_file))
-        enc_size = enc_file.stat().st_size
+        enc_size = enc_file.stat().st_size * 8 # in bits
         pixels = src_img.size[0] * src_img.size[1]
         total_encoded_size += enc_size
         total_pixels += pixels
