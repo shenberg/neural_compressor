@@ -22,7 +22,7 @@ if torch.cuda.is_available:
 
 from tqdm import tqdm
 
-from models.autoencoder import ContextModel, ContextModelMultilayered, SoftToHardVectorEncoder, ResNetEncoder, ResNetDecoder
+from models.autoencoder import ContextModel, ContextModelMultilayered, SoftToHardVectorEncoder, ResNetEncoder, ResNetDecoder, ConvMaxEncoder
 
 import argparse
 import pathlib
@@ -68,9 +68,11 @@ def p2cf(prob, resolution=1024):
 # calculated using range_coder's exact solution, for frequencies: [5355,5730330, 360699]
 # for exactly one image :(
 # recalculated using [   3892., 1528296., 1532160.]
-ROUNDING_CUMPROB = [0, 3, 1021, 1024]
+# error 1e-5: ROUNDING_CUMPROB = [0, 3, 1021, 1024]
+ROUNDING_CUMPROB = [0, 1, 8191, 8192]
+FIXED_PROBS_RESOLUTION = 1024 # must be power of 2
 
-def probabilities_to_cum_freq_with_rounding(prob, num_bins=256, error=1e-5):
+def probabilities_to_cum_freq_with_rounding(prob, num_bins=128, error=1e-6):
     num_symbols = len(prob)
     resolution = 1/num_bins
     #error = resolution
@@ -91,7 +93,7 @@ def probabilities_to_cum_freq_with_rounding(prob, num_bins=256, error=1e-5):
     freqs_final = [0] + freqs.astype(np.int).tolist()
     return freqs_final, (roundings.astype(np.int) + 1).tolist()
 
-def probabilities_to_cum_freq_from_rounding(prob, rounding, num_bins=256, error=1e-5):
+def probabilities_to_cum_freq_from_rounding(prob, rounding, num_bins=512, error=1e-6):
     num_symbols = len(prob)
     resolution = 1/num_bins
     #error = resolution
@@ -139,14 +141,18 @@ def probabilities_to_cum_freq_no_guards(prob, num_bins=4096):
     freqs[-1] = num_bins
     return [0] + freqs.tolist()
 
+def get_fixed_cumprob(num_symbols, resolution=FIXED_PROBS_RESOLUTION):
+    return [round(i/num_symbols*resolution) for i in range(num_symbols + 1)]
 
-def calculate_padding(width, height):
-    return (((-width) % 16), ((-height) % 16))
+
+def calculate_padding(width, height, xy_size):
+    padding = xy_size * 8 # 8 because 3 padding layers
+    return (((-width) % padding), ((-height) % padding))
 
 def encode(dest_path, img_var, encoder, quantizer, context_model):
     # TODO: pad so that each dim divides by 16
     img_width, img_height = img_var.size(3), img_var.size(2)
-    pad_x, pad_y = calculate_padding(img_width, img_height)
+    pad_x, pad_y = calculate_padding(img_width, img_height, quantizer.xy_size)
     if pad_x != 0 or pad_y !=0:
         print("padding image!")
         img_var = F.pad(img_var, ((pad_x + 1) // 2, pad_x // 2, (pad_y + 1) // 2, pad_y // 2))
@@ -154,7 +160,7 @@ def encode(dest_path, img_var, encoder, quantizer, context_model):
     # assume img_var is 1xCxHxW
     latent = encoder(img_var)
     # take hard quantization results and integer symbols
-    quantized, symbols = quantizer(latent)
+    quantized, symbols, _ = quantizer(latent)
 
     quantized = quantized.contiguous()
 
@@ -166,8 +172,11 @@ def encode(dest_path, img_var, encoder, quantizer, context_model):
     # NOTE: we move from variable to tensor
     # NOTE: move to CPU
     # TODO: log_softmax and then exp?
-    post_context = context_model(quantized)
-    probabilities = F.softmax(post_context.cpu(), dim=1).data
+    if context_model is not None:
+        post_context = context_model(quantized)
+        probabilities = F.softmax(post_context.cpu(), dim=1).data
+    else:
+        fixed_probs = get_fixed_cumprob(quantizer.num_codes)
     #print(probabilities.size())
 
     #cum_prob = probabilities.cumsum(dim=1)
@@ -184,24 +193,27 @@ def encode(dest_path, img_var, encoder, quantizer, context_model):
         for channel in tqdm(range(depth)):
             for row in range(height):
                 for col in range(width):
-                    probs = probabilities[0, :, channel, row, col]
-                    # TODO: faster prob_to_cum_freq on gpu
-                    # TODO: use higher precision? 
-                    #cumprob = prob_to_cum_freq(probs.cpu().numpy())
-                    
-                    #cumprob = p2cf(probs.cpu().numpy().astype(np.float64), 1024)
-                    cumprob, rounds = probabilities_to_cum_freq_with_rounding(probs.cpu().numpy().astype(np.float64))
-                    #cumprob = probabilities_to_cum_freq_with_guards(probs.cpu().numpy())
-                    #cumprob = probabilities_to_cum_freq_no_guards(probs.cpu().numpy())
-                    cumprobs.append(cumprob)
-                    enc.encode(rounds, ROUNDING_CUMPROB)
-                    #enc.encode([symbols[0, channel, row, col]*2 + 1], cumprob)
-                    enc.encode([symbols[0, channel, row, col]], cumprob)
-    torch.save(cumprobs, dest_path + '.probs')
-    torch.save(probabilities, dest_path + '.ps')
-    torch.save(post_context, dest_path + '.pcm')
-    torch.save(quantized, dest_path + '.lat')
-    torch.save(symbols, dest_path + '.sym')
+                    if context_model is not None:
+                        probs = probabilities[0, :, channel, row, col]
+                        # TODO: faster prob_to_cum_freq on gpu
+                        # TODO: use higher precision? 
+                        #cumprob = prob_to_cum_freq(probs.cpu().numpy())
+                        
+                        #cumprob = p2cf(probs.cpu().numpy().astype(np.float64), 1024)
+                        cumprob, rounds = probabilities_to_cum_freq_with_rounding(probs.cpu().numpy().astype(np.float64))
+                        #cumprob = probabilities_to_cum_freq_with_guards(probs.cpu().numpy())
+                        #cumprob = probabilities_to_cum_freq_no_guards(probs.cpu().numpy())
+                        #cumprobs.append(cumprob)
+                        enc.encode(rounds, ROUNDING_CUMPROB)
+                        #enc.encode([symbols[0, channel, row, col]*2 + 1], cumprob)
+                        enc.encode([symbols[0, channel, row, col]], cumprob)
+                    else:
+                        enc.encode([symbols[0, channel, row, col]], fixed_probs)
+    #torch.save(cumprobs, dest_path + '.probs')
+    #torch.save(probabilities, dest_path + '.ps')
+    #torch.save(post_context, dest_path + '.pcm')
+    #torch.save(quantized, dest_path + '.lat')
+    #torch.save(symbols, dest_path + '.sym')
 
 def decode_symbols(src_path, quantizer, context_model):
     # quantizer knows how many dimensions it has
@@ -210,16 +222,20 @@ def decode_symbols(src_path, quantizer, context_model):
     xy_size = quantizer.xy_size
     num_symbols = quantizer.num_codes
 
-    # dims are <num_layers> x <num_symbols> x (vector_size * (xy_size**2))
+    if not isinstance(quantizer, ConvMaxEncoder):
+        # dims are <num_layers> x <num_symbols> x (vector_size * (xy_size**2))
+        codes_wrong_order = quantizer.codes.data
+        # reorder to (num_layers * num_symbols) x (vector_size * (xy_size**2)) x 1 x 1
+        codes = codes_wrong_order.view(-1, vector_size)[:,:,None,None]
+    else:
+        # dims are (channels * num_symbols) x (vector_size * (xy_size ** 2)))x1x1
+        codes = quantizer.encoder.weight.data
 
-    codes_wrong_order = quantizer.codes.data
-    # reorder to (num_layers * num_symbols) x (vector_size * (xy_size**2)) x 1 x 1
-    codes = codes_wrong_order.view(-1, vector_size)
-    codes = F.pixel_shuffle(autograd.Variable(codes, volatile=True)[:,:,None,None], upscale_factor=xy_size).data
+    if codes.size()[-1] != xy_size:
+        codes = F.pixel_shuffle(autograd.Variable(codes, volatile=True), upscale_factor=xy_size).data
     # now num_layers * num_symbols x vector_size x xy_size x xy_size
     # reshape to separate between layers again
     codes = codes.view(channels, quantizer.num_codes, vector_size, xy_size, xy_size)
-
 
     int_cumprob = list(range(257))
     with contextlib.closing(RangeDecoder(str(src_path))) as dec:
@@ -228,7 +244,7 @@ def decode_symbols(src_path, quantizer, context_model):
         output_width = width_l + (width_h << 8)
         output_height = height_l + (height_h << 8)
 
-        pad_x, pad_y = calculate_padding(output_width, output_height)
+        pad_x, pad_y = calculate_padding(output_width, output_height, quantizer.xy_size)
         width = output_width + pad_x
         height = output_height + pad_y
         if pad_x != 0 or pad_y !=0:
@@ -241,73 +257,33 @@ def decode_symbols(src_path, quantizer, context_model):
         symbols.fill_(0)
 
         context_layers = 4 # TODO: hack
-        if isinstance(context_model, ContextModel):
-            # TODO: cuda hacks
-            # TODO: no ugly work directly with 3d tensor
-            decoded_latent = autograd.Variable(torch.zeros(1, vector_size, channels, latent_height, latent_width),
-                                               volatile=True)
-            if use_cuda:
-                decoded_latent = decoded_latent.cuda()
+        if (context_model is not None) and (not isinstance(context_model, ContextModelMultilayered)):
+            raise ValueError("Unsupported context model {}, revert to old version".format(type(context_model)))
 
-            for channel in tqdm(range(channels)):
-                channel_offset = channel * vector_size
+        if context_model is None:
+            fixed_probs = get_fixed_cumprob(num_symbols)
+        cumprobs = []
+        # TODO: crap
+        context_layers = 4
 
-                channel_start = max(0, channel - context_layers)
-                channel_end = min(channels * vector_size, channel + 1)
+        decoded_latent = autograd.Variable(torch.zeros(1, vector_size*channels, latent_height, latent_width),
+                               volatile=True)
+        # TODO: cuda hack
+        if use_cuda:
+            decoded_latent = decoded_latent.cuda()
+        for channel in tqdm(range(channels)):
+            channel_end = (channel + 1) * vector_size
 
-                for row in range(latent_height):
-                    row_start = max(0, row - context_layers)
-                    row_end = min(latent_height, row + context_layers + 1)
+            for row in range(0, latent_height, xy_size):
+                row_start = max(0, row - context_layers*xy_size)
+                row_end = min(latent_height, row + (context_layers + 1)*xy_size)
 
-                    # if row is < context_layers, row index the correct index in the row
+                # if row is < context_layers, row index the correct index in the row
 
-                    row_in_window = min(row, context_layers)
-                    #window = decoded_latent[:,channel_start:channel_end, row_start:row_end, :].contiguous()
-                    for col in range(latent_width):
-                        roundings = dec.decode(num_symbols - 1, ROUNDING_CUMPROB)
-                        #roundings = np.zeros(vector_size)
-                        col_start = max(0, col - context_layers)
-                        col_end = min(latent_width, col + context_layers + 1)
-                        col_in_window = min(col, context_layers)
-                        #probabilities = F.softmax(context_model(decoded_latent[:,:channel_offset + vector_size,:,:]), dim=1)
-                        #probs = probabilities.data[0, :, channel, row, col]
-                        window = decoded_latent[:,:,channel_start:channel_end, row_start:row_end, col_start:col_end]
-                        # only pass window seen by context
-                        post_context = context_model(window)
-                        # calculate softmax only on specific probabilities we added now
-                        probs = F.softmax(post_context[0, :, -1, row_in_window, col_in_window].cpu(), dim=0).data
-                        #probs = F.softmax(post_context[0, :, -1, row_in_window, col], dim=0).data
-                        # TODO: use higher precision?
-                        #cumprob = prob_to_cum_freq(probs.cpu().numpy())
-                        #cumprob = p2cf(probs.cpu().numpy().astype(np.float64), 1024)
-                        cumprob = probabilities_to_cum_freq_from_rounding(probs.cpu().numpy().astype(np.float64), roundings)
-                        symbol = dec.decode(1, cumprob)[0]
-                        symbols[channel, row, col] = symbol
-                        symbol_vector = quantizer.codes.data[channel, symbol]
-                        decoded_latent.data[0, :, channel, row, col] = symbol_vector
-            decoded_latent = decoded_latent.transpose(1,2).contiguous().view(1, channels * vector_size, latent_height, latent_width)
-        elif isinstance(context_model, ContextModelMultilayered):
-            cumprobs = []
-            # TODO: crap
-            context_layers = 4
-
-            decoded_latent = autograd.Variable(torch.zeros(1, vector_size*channels, latent_height, latent_width),
-                                   volatile=True)
-            # TODO: cuda hack
-            if use_cuda:
-                decoded_latent = decoded_latent.cuda()
-            for channel in tqdm(range(channels)):
-                channel_end = (channel + 1) * vector_size
-
-                for row in range(0, latent_height, xy_size):
-                    row_start = max(0, row - context_layers*xy_size)
-                    row_end = min(latent_height, row + (context_layers + 1)*xy_size)
-
-                    # if row is < context_layers, row index the correct index in the row
-
-                    row_in_window = min(row // xy_size, context_layers)
-                    #window = decoded_latent[:,channel_start:channel_end, row_start:row_end, :].contiguous()
-                    for col in range(0, latent_width, xy_size):
+                row_in_window = min(row // xy_size, context_layers)
+                #window = decoded_latent[:,channel_start:channel_end, row_start:row_end, :].contiguous()
+                for col in range(0, latent_width, xy_size):
+                    if context_model is not None:
                         roundings = dec.decode(num_symbols - 1, ROUNDING_CUMPROB)
                         #roundings = np.zeros(vector_size)
                         col_start = max(0, col - context_layers*xy_size)
@@ -323,18 +299,17 @@ def decode_symbols(src_path, quantizer, context_model):
                         #cumprob = p2cf(probs.cpu().numpy(), 1024)
                         cumprob = probabilities_to_cum_freq_from_rounding(probs.cpu().numpy().astype(np.float64), roundings)
                         #cumprob = probabilities_to_cum_freq_no_guards(probs.cpu().numpy())
-                        cumprobs.append(cumprob)
+                        #cumprobs.append(cumprob)
                         symbol = dec.decode(1, cumprob)[0]
-                        symbols[channel, row // xy_size, col // xy_size] = symbol
-                        symbol_vector = codes[channel, symbol]
-                        decoded_latent.data[0, channel_end - vector_size : channel_end, row : row + xy_size, col : col + xy_size] = symbol_vector
-                        
-        else:
-            raise Exception("bad context model type: {}".format(context_model))
+                    else:
+                        symbol = dec.decode(1, fixed_probs)[0]
+                    #symbols[channel, row // xy_size, col // xy_size] = symbol
+                    symbol_vector = codes[channel, symbol]
+                    decoded_latent.data[0, channel_end - vector_size : channel_end, row : row + xy_size, col : col + xy_size] = symbol_vector
 
-    torch.save(cumprobs, src_path + '.dec.probs')
-    torch.save(symbols, src_path + '.dec.sym')
-    torch.save(decoded_latent, src_path + '.dec.lat')
+    #torch.save(cumprobs, src_path + '.dec.probs')
+    #torch.save(symbols, src_path + '.dec.sym')
+    #torch.save(decoded_latent, src_path + '.dec.lat')
     # shuffle to regular form
     return decoded_latent, output_width, output_height
 
@@ -345,7 +320,7 @@ def decode(src_path, decoder, quantizer, context_model):
     #print(decoded_latent.size())
     decoded_image = decoder(decoded_latent).data[0]
     if (decoded_image.size(1) != output_height) or (decoded_image.size(2) != output_width):
-        pad_x, pad_y = calculate_padding(output_width, output_height)
+        pad_x, pad_y = calculate_padding(output_width, output_height, quantizer.xy_size)
         return decoded_image[:, \
                         (pad_y + 1) // 2 : decoded_image.size(1) - (pad_y // 2), \
                         (pad_x + 1) // 2 : decoded_image.size(2) - (pad_x // 2)]
@@ -360,8 +335,10 @@ def main():
     command = parser.add_mutually_exclusive_group(required=True)
     command.add_argument("-x","--extract", action="store_true")
     command.add_argument("-c","--compress", action="store_true")
-    parser.add_argument("-m", "--model-dir", default="/mnt/7FC1A7CD7234342C/compression-results/2018_05_15_21_22_28")
+    #parser.add_argument("-m", "--model-dir", default="/mnt/7FC1A7CD7234342C/compression-results/2018_05_15_21_22_28")
+    parser.add_argument("-m", "--model-dir", default="/mnt/7FC1A7CD7234342C/compression-results/2018_06_16_22_35_52")
     parser.add_argument("--cuda", action="store_true")
+    parser.add_argument("--no-context", action="store_true")
     # TODO: specific model instead of dir
     #parser.add_argument
     parser.add_argument("source")
@@ -386,17 +363,27 @@ def main():
     decoder = ResNetDecoder(latent_dim=model_args.latent_dim)
     # TODO: toggle
     #quantizer = SoftToHardEncoder(num_codes=model_args.num_centers, latent_dim=model_args.latent_dim)
-    quantizer = SoftToHardVectorEncoder(num_codes=model_args.num_centers, 
+    if not getattr(model_args, 'convmax', False):
+        quantizer = SoftToHardVectorEncoder(num_codes=model_args.num_centers, 
+                                        latent_dim=model_args.latent_dim // model_args.vq_dim, 
+                                        channel_dim = model_args.vq_dim,
+                                        xy_size = model_args.vq_spatial_dim)
+    else:
+        quantizer = ConvMaxEncoder(num_codes=model_args.num_centers, 
                                     latent_dim=model_args.latent_dim // model_args.vq_dim, 
                                     channel_dim = model_args.vq_dim,
                                     xy_size = model_args.vq_spatial_dim)
-    if not model_args.use_layered_context:
-        context_model = ContextModel(model_args.num_centers, model_args.vq_dim)
+
+    if not args.no_context:
+        if not model_args.use_layered_context:
+            context_model = ContextModel(model_args.num_centers, model_args.vq_dim)
+        else:
+            context_model = ContextModelMultilayered(model_args.num_centers,
+                                                     model_args.vq_dim,
+                                                     model_args.latent_dim // model_args.vq_dim,
+                                                     model_args.vq_spatial_dim)
     else:
-        context_model = ContextModelMultilayered(model_args.num_centers,
-                                                 model_args.vq_dim,
-                                                 model_args.latent_dim // model_args.vq_dim,
-                                                 model_args.vq_spatial_dim)
+        context_model = None
 
     #print(decoder)
     #print(encoder)
@@ -409,7 +396,8 @@ def main():
         encoder = encoder.cuda(gpu)
         decoder = decoder.cuda(gpu)
         quantizer = quantizer.cuda(gpu)
-        context_model = context_model.cuda(gpu)
+        if context_model is not None:
+            context_model = context_model.cuda(gpu)
         state_dict = torch.load(str(model_path))
     # TODO: gpu/cpu load toggle
     else:
@@ -418,12 +406,13 @@ def main():
     decoder.load_state_dict(state_dict['decoder_dict'], strict=True)
     encoder.load_state_dict(state_dict['encoder_dict'], strict=True)
     quantizer.load_state_dict(state_dict['quantizer'], strict=True)
-    context_model.load_state_dict(state_dict['context_model'], strict=True)
+    if context_model is not None:
+        context_model.load_state_dict(state_dict['context_model'], strict=True)
+        context_model.eval()
 
     decoder.eval()
     encoder.eval()
     quantizer.eval()
-    context_model.eval()
 
 
     start_time = time.time()

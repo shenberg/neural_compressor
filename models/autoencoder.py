@@ -5,7 +5,8 @@ import torch.nn.functional as F
 import torch.autograd as autograd
 from collections import OrderedDict
 
-from .main import PSPModule
+from .main import PSPModule, PSPPriors, PSPBottleneck
+from .layers import UpscaleSR
 from .densenet import _DenseBlock, _Transition
 
 def plain_res_block(in_dim, out_dim, conv):
@@ -65,13 +66,15 @@ class ResNetEncoder(nn.Module):
         self.use_psp = psp
         if self.use_psp:
             self.psp = PSPModule(128, 128) #TODO: games
+        #self.psp_priors = PSPPriors(128)
         # In paper, this:
-        #self.final = conv(128, latent_dim, kernel_size=5, padding=2, stride=2, bias=True)
-        self.final = nn.Conv2d(128, latent_dim, kernel_size=5, padding=2, stride=2, bias=True)
+        self.final = conv(128, latent_dim, kernel_size=5, padding=2, stride=2, bias=True)
+        #self.final = nn.Conv2d(128, latent_dim, kernel_size=5, padding=2, stride=2, bias=True)
         # but details imply this:
-        # self.final = nn.Sequential(
-        #             conv(128, latent_dim, kernel_size=5, padding=2, stride=2, bias=True),
+        #self.final = nn.Sequential(
+        #             conv(128, latent_dim, kernel_size=5, padding=2, stride=2, bias=False),
         #             # TODO: test BN here too
+        #             nn.BatchNorm2d(latent_dim),
         #             nn.ReLU(inplace=True),
         #             )
 
@@ -80,8 +83,9 @@ class ResNetEncoder(nn.Module):
         h = self.main(h)
         if self.use_psp:
             h = self.psp(h)
+        #priors = self.psp_priors(h)
         h = self.final(h)
-        return h
+        return h#, priors
 
 class ResNetMultiscaleEncoder(nn.Module):
     def __init__(self, latent_dim, psp=False, res_blocks=5, depth=3, conv=nn.Conv2d):
@@ -162,7 +166,10 @@ def _upscale_resize(in_dim, out_dim, kernel_size):
 class ResNetDecoder(nn.Module):
     def __init__(self, latent_dim, res_blocks=5, depth=3, conv=nn.ConvTranspose2d, psp=False):
         super().__init__()
-        self.input_transform = nn.Sequential(*_upscale_resize(latent_dim, 128, 5))
+        #self.input_transform = nn.Sequential(*_upscale_resize(latent_dim, 128, 5))
+        #TODO: SR test
+        self.input_transform = UpscaleSR(latent_dim, 128)
+        
         # TODO: padding hack
         # self.input_transform = nn.Sequential(
         #     conv(latent_dim, 128, kernel_size=5, padding=1, stride=2, bias=False),
@@ -171,7 +178,9 @@ class ResNetDecoder(nn.Module):
         #     nn.ReLU(inplace=True),
         #     )
         self.output_transform = nn.Sequential(
-            *(_upscale_resize(128, 64, 5) + _upscale_resize(64,64,5) +
+            #*(_upscale_resize(128, 64, 5) + _upscale_resize(64,64,5) +
+            # TODO: SR test
+            *([UpscaleSR(128, 64), UpscaleSR(64, 64)] +
                 [conv(64, 3, kernel_size=3, padding=1, stride=1, bias=True),
                  nn.Sigmoid()])
             )
@@ -198,9 +207,11 @@ class ResNetDecoder(nn.Module):
         self.use_psp = psp
         if self.use_psp:
             self.psp = PSPModule(128, 128) #TODO: games
+        self.bottleneck = PSPBottleneck(128, 128)
 
-    def forward(self, x):
+    def forward(self, x):#, priors):
         h = self.input_transform(x)
+        #h = self.bottleneck(h, priors)
         h = self.main(h)
         if self.use_psp:
             h = self.psp(h)
@@ -208,6 +219,108 @@ class ResNetDecoder(nn.Module):
         return h
         #TODO: padding hack
         #return h[:,:,:h.size(2)-1, :h.size(3)-1]
+
+class ConvMaxEncoder(nn.Module):
+    def __init__(self, num_codes, latent_dim, channel_dim, xy_size):
+        super().__init__()
+        self.num_codes = num_codes
+        self.latent_dim = latent_dim
+        self.channel_dim = channel_dim
+        self.xy_size = xy_size
+        #self.full_latent_dim = latent_dim * channel_dim * (xy_size**2)
+        self.full_latent_dim = latent_dim * channel_dim
+        self.total_dim = channel_dim * (xy_size**2)
+        #self.encoder = nn.Conv2d(self.full_latent_dim,
+        #                         num_codes * latent_dim,
+        #                         kernel_size=xy_size, stride=xy_size, groups=latent_dim, bias=False)
+        #self.norm = nn.BatchNorm2d(latent_dim * self.total_dim)
+        self.encoder = nn.Conv2d(latent_dim * self.total_dim,
+                                 num_codes * latent_dim,
+                                 kernel_size=1, stride=1, groups=latent_dim, bias=False)
+                                 
+        # TODO: tie weights to encoder
+        self.decoder = nn.ConvTranspose2d(num_codes * latent_dim,
+                                 latent_dim * self.total_dim,
+                                 3, stride=1,padding=1, bias=False)#TODO:#groups=latent_dim, bias=False)
+        #self.decoder = nn.Sequential(nn.ConvTranspose2d(num_codes * latent_dim,
+        #                         latent_dim * channel_dim,
+        #                         2, stride=xy_size,padding=0, bias=False),)
+                                 #nn.BatchNorm2d(latent_dim * channel_dim),
+                                 #nn.ReLU(True))#TODO:#groups=latent_dim, bias=False)
+
+    def forward(self, x):
+        h = pixel_unshuffle(x, self.xy_size)
+        #h = F.relu(self.norm(h), inplace=True)
+        #h = x
+        h = self.encoder(h)
+        # BCHW -> B C//num_codes num_codes H W
+        h = h.view(h.size(0), h.size(1) // self.num_codes, self.num_codes, 
+                    h.size(2), h.size(3))
+        soft_symbols = F.softmax(h, dim=2)
+        # TODO: hack! smooth context to block cheating
+        #soft_symbols = soft_symbols + torch.autograd.Variable(torch.cuda.FloatTensor(h.size(0),h.size(1),h.size(2),1,1).normal_()*0.02)
+        # max sampling
+        _, idxes = torch.max(h, dim=2, keepdim=True)
+        #TODO: remove
+        #soft_symbols = soft_symbols.view(h.size(0), h.size(1) * self.num_codes, h.size(3), h.size(4))
+        #return F.pixel_shuffle(self.decoder(soft_symbols), self.xy_size), idxes.squeeze(2), h
+        #return F.pixel_shuffle(F.conv_transpose2d(soft_symbols, self.encoder.weight, self.encoder.bias, groups=self.latent_dim), self.xy_size), idxes.squeeze(2), h
+        hard_symbols = torch.zeros_like(soft_symbols)
+        hard_symbols.scatter_(2, idxes, 1)
+        # multinomial sample
+        #soft_symbols2 = soft_symbols.permute(0,1,3,4,2).contiguous().view(-1,self.num_codes)
+        #idxes = torch.multinomial(soft_symbols2, 1)
+        #hard_symbols = torch.zeros_like(soft_symbols2)
+        #hard_symbols.scatter_(1, idxes, 1)
+        #idxes = idxes.view(h.size(0), h.size(1), 1, h.size(3), h.size(4))
+        #hard_symbols = hard_symbols.view(h.size(0), h.size(1), h.size(3), h.size(4), h.size(2))
+        #hard_symbols = hard_symbols.permute(0,1,4,2,3)
+
+        hard_symbols = (hard_symbols - soft_symbols).detach() + soft_symbols
+        hard_symbols = hard_symbols.view(h.size(0), h.size(1) * self.num_codes, h.size(3), h.size(4))
+        # hard symbols for context model
+        #return F.pixel_shuffle(self.decoder(hard_symbols), self.xy_size), idxes.squeeze(2), hard_symbols
+        #return self.decoder(hard_symbols), idxes.squeeze(2), hard_symbols
+        # scores for cross-entropy
+        #return F.pixel_shuffle(self.decoder(hard_symbols), self.xy_size), idxes.squeeze(2), h
+        return F.pixel_shuffle(
+            F.conv_transpose2d(hard_symbols, self.encoder.weight, self.encoder.bias, groups=self.latent_dim),
+            self.xy_size), idxes.squeeze(2), hard_symbols
+        #hard_symbols = F.conv_transpose2d(hard_symbols, self.encoder.weight, self.encoder.bias, stride=self.xy_size, groups=self.latent_dim)
+        #return F.pixel_shuffle(hard_symbols, self.xy_size), idxes.squeeze(2)
+        #return hard_symbols, idxes.squeeze(2)
+
+
+
+
+class ConvMaxDoubleEncoder(nn.Module):
+    def __init__(self, num_codes, latent_dim, channel_dim, xy_size):
+        super().__init__()
+        half_dim = latent_dim // 2
+        self.deep_enc = ConvMaxEncoder(num_codes, half_dim, channel_dim, 1)
+        self.shallow_enc = ConvMaxEncoder(num_codes, half_dim*channel_dim, 1, xy_size)
+
+    def forward(self, x):
+        half_dim = x.size(1) // 2
+        h1, s1 = self.deep_enc(x[:,:half_dim])
+        h2, s2 = self.shallow_enc(x[:,half_dim:].contiguous())
+        return torch.cat([h1, h2], dim=1), (s1,s2)
+
+class ConvMaxTripleEncoder(nn.Module):
+    def __init__(self, num_codes, latent_dim, channel_dim, xy_size):
+        super().__init__()
+        q_dim = latent_dim // 4
+        self.deep_enc = ConvMaxEncoder(num_codes, q_dim//channel_dim, channel_dim, 1)
+        # q_dim * 2 // (channel_dim // 4) because half of the latent dim
+        self.med_enc = ConvMaxEncoder(num_codes, q_dim*8//channel_dim, channel_dim//4, 2)
+        self.shallow_enc = ConvMaxEncoder(num_codes, q_dim, 1, xy_size)
+
+    def forward(self, x):
+        q_dim = x.size(1) // 4
+        h1, s1 = self.deep_enc(x[:,:q_dim])
+        h2, s2 = self.med_enc(x[:,q_dim:3*q_dim].contiguous())
+        h3, s3 = self.shallow_enc(x[:,3*q_dim:].contiguous())
+        return torch.cat([h1, h2, h3], dim=1), (s1,s2,s3)
 
 
 # Encode 1d samples, separate encoder per channel
@@ -232,9 +345,9 @@ class SoftToHardEncoder(nn.Module):
         W = self.codes.weight[None,None,None]
         # duplicate each channel value along the last axis
         # so now BxWxHxCxnum_codes matrix
-        expanded = h.unsqueeze(-1).expand(h.size() + (self.num_codes,))
+        h = h.unsqueeze(-1).expand(h.size() + (self.num_codes,))
 
-        distances = (expanded - W).abs()
+        distances = (h - W).abs()
 
         symbol_probs = self.softmin(distances)
         # sum of symbols weighted by their odds
@@ -285,11 +398,11 @@ class SoftToHardNdEncoder(nn.Module):
         # duplicate each channel vector num_codes times
         # so we can get the distance between each vector and its codes
         # so now BxWxHxCxnum_codesxchannel_dim matrix
-        expanded = h[:,:,:,:,None,:].expand(
+        h = h[:,:,:,:,None,:].expand(
             (batch, height, width, channels // self.channel_dim, self.num_codes, self.channel_dim)
         )
         # last dim is vector - code for each vector in each channel
-        distances = (expanded - W).norm(p=2, dim=5)
+        distances = (h - W).norm(p=2, dim=5)
 
         symbol_probs = self.softmin(distances)
         # sum of symbols weighted by their odds
@@ -324,6 +437,18 @@ class SoftToHardNdEncoder(nn.Module):
     
         return quantized, idxes
 
+def pixel_unshuffle(z, xy_size):
+    if xy_size == 1:
+        h = z
+    else:
+        # pixel unshuffle manually
+        out_channel = z.size(1)*(xy_size**2)
+        out_h = z.size(2)//xy_size
+        out_w = z.size(3)//xy_size
+        h = z.view(z.size(0), z.size(1), out_h, xy_size, out_w, xy_size)
+        h = h.permute(0,1,3,5,2,4).contiguous().view(z.size(0),out_channel, out_h, out_w)
+    return h
+
 # Encode Nd samples, separate encoder per channel
 class SoftToHardVectorEncoder(nn.Module):
     def __init__(self, num_codes, latent_dim, channel_dim, xy_size):
@@ -341,15 +466,7 @@ class SoftToHardVectorEncoder(nn.Module):
         self.softmin = nn.Softmin(dim=4) # intended to work on BxHxWxCxnum_codes matrices
 
     def forward(self, z):
-        if self.xy_size == 1:
-            h = z
-        else:
-            # pixel unshuffle manually
-            out_channel = z.size(1)*(self.xy_size**2)
-            out_h = z.size(2)//self.xy_size
-            out_w = z.size(3)//self.xy_size
-            h = z.view(z.size(0), z.size(1), out_h, self.xy_size, out_w, self.xy_size)
-            h = h.permute(0,1,3,5,2,4).contiguous().view(z.size(0),out_channel, out_h, out_w)
+        h = pixel_unshuffle(z, self.xy_size)
         # BCWH -> BHWC
         h = h.permute(0,2,3,1)
         batch, height, width, channels = h.size()
@@ -361,11 +478,11 @@ class SoftToHardVectorEncoder(nn.Module):
         # duplicate each channel vector num_codes times
         # so we can get the distance between each vector and its codes
         # so now BxWxHxCxnum_codesxchannel_dim matrix
-        expanded = h[:,:,:,:,None,:].expand(
+        h = h[:,:,:,:,None,:].expand(
             (batch, height, width, channels // self.total_dim, self.num_codes, self.total_dim)
         )
         # last dim is vector - code for each vector in each channel
-        distances = (expanded - W).norm(p=2, dim=5)
+        distances = (h - W).norm(p=2, dim=5)
 
         symbol_probs = self.softmin(distances)
         # sum of symbols weighted by their odds
@@ -487,20 +604,39 @@ class ChannelMaskedConv2d(nn.Conv2d):
 
 
 class ContextModel2d(nn.Module):
-    def __init__(self, centers, vq_dim, in_channels, xy_size=1, channels=24):
+    def __init__(self, centers, vq_dim, in_channels, xy_size=1, channels=48):
         super().__init__()
         self.centers = centers
         self.vq_dim = vq_dim
         self.initial = nn.Sequential(
             ChannelMaskedConv2d('A', in_channels - vq_dim, in_channels, channels, kernel_size=3*xy_size, padding=xy_size, stride=xy_size),
+            nn.BatchNorm2d(channels),
             nn.ReLU(inplace=True)
             )
         self.main = nn.Sequential(
-            ChannelMaskedConv2d('B', 0, channels, channels, kernel_size=3, padding=1),
+            ChannelMaskedConv2d('B', 0, channels, channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(channels),
             nn.ReLU(inplace=True),
-            ChannelMaskedConv2d('B', 0, channels, channels, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True)
+            ChannelMaskedConv2d('B', 0, channels, channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(channels),
+            #nn.ReLU(inplace=True)
             )
+        #self.main2 = nn.Sequential(
+        #    ChannelMaskedConv2d('B', 0, channels, channels, kernel_size=3, padding=1, bias=False),
+        #    nn.BatchNorm2d(channels),
+        #    nn.ReLU(inplace=True),
+        #    ChannelMaskedConv2d('B', 0, channels, channels, kernel_size=3, padding=1),
+        #    nn.BatchNorm2d(channels),
+        #    #nn.ReLU(inplace=True)
+        #    )
+        #self.main3 = nn.Sequential(
+        #    ChannelMaskedConv2d('B', 0, channels, channels, kernel_size=3, padding=2, dilation=2, bias=False),
+        #    nn.BatchNorm2d(channels),
+        #    nn.ReLU(inplace=True),
+        #    ChannelMaskedConv2d('B', 0, channels, channels, kernel_size=3, padding=4, dilation=4),
+        #    nn.BatchNorm2d(channels),
+        #    #nn.ReLU(inplace=True)
+        #    )
 
         # In paper:
         self.output = nn.Sequential(
@@ -511,9 +647,12 @@ class ContextModel2d(nn.Module):
         #self.output = ChannelMaskedConv2d('B', 0, channels, centers, kernel_size=3, padding=1)
 
     def forward(self, x):
-        h = self.initial(x)
-        h = h + self.main(h)
-        return self.output(h)
+        h1 = self.initial(x)
+        h = self.main(h1)
+        #h = h1 + self.main(h1)
+        #h = h + self.main2(h)
+        #h = h + self.main3(h)
+        return self.output(h1 + h)
 
 class ContextModelMultilayered(nn.Module):
     def __init__(self, centers, vq_dim, layers, xy_size):

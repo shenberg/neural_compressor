@@ -23,7 +23,8 @@ from tqdm import tqdm
 
 from models.autoencoder import ContextModel, ContextModelMultilayered, SoftToHardNdEncoder, \
                                 ResNetEncoder, ResNetDecoder, ResNetMultiscaleEncoder, DenseEncoder, \
-                                LayerDropout2d, SoftToHardVectorEncoder
+                                LayerDropout2d, SoftToHardVectorEncoder, \
+                                ConvMaxEncoder, ConvMaxDoubleEncoder, ConvMaxTripleEncoder
 
 from utils import EagerFolder, save_images
 #import orthoreg
@@ -52,7 +53,6 @@ def weights_init(m):
     elif classname.find('Linear') != -1:
         m.weight.data.normal_(0.0, 0.01)
         m.bias.data.fill_(0)
-
 
 
 #decoded, real_data_v = 0, 0
@@ -85,6 +85,8 @@ def main():
     parser.add_argument("--no-context",dest="use_context",action="store_false")
     parser.add_argument("--vq-spatial-dim", type=int, default=2)
     parser.add_argument("--context-smoothing", action="store_true")
+    parser.add_argument("--convmax", action="store_true")
+    parser.add_argument("--softplus", action="store_true", help="softplus on coding loss")
 
     args = parser.parse_args()
 
@@ -107,19 +109,36 @@ def main():
     decoder = ResNetDecoder(latent_dim=args.latent_dim, psp=args.decoder_psp)
     # TODO: toggle
     #quantizer = SoftToHardEncoder(num_codes=args.num_centers, latent_dim=args.latent_dim)
-    if args.vq_spatial_dim == 1:
+    if args.vq_spatial_dim == 1 and not args.convmax:
         quantizer = SoftToHardNdEncoder(num_codes=args.num_centers, 
                                         latent_dim=args.latent_dim // args.vq_dim, 
                                         channel_dim = args.vq_dim)
-    else:
+    elif not args.convmax:
         quantizer = SoftToHardVectorEncoder(num_codes=args.num_centers, 
                                         latent_dim=args.latent_dim // args.vq_dim, 
                                         channel_dim = args.vq_dim,
                                         xy_size = args.vq_spatial_dim)
+    else:
+        quantizer = ConvMaxEncoder(num_codes=args.num_centers, 
+                                        latent_dim=args.latent_dim // args.vq_dim, 
+                                        channel_dim = args.vq_dim,
+                                        xy_size = args.vq_spatial_dim)
+        #quantizer = ConvMaxDoubleEncoder(num_codes=args.num_centers, 
+        #                                latent_dim=args.latent_dim // args.vq_dim, 
+        #                                channel_dim = args.vq_dim,
+        #                                xy_size = args.vq_spatial_dim)
+        #quantizer = ConvMaxTripleEncoder(num_codes=args.num_centers, 
+        #                                latent_dim=args.latent_dim, 
+        #                                channel_dim = args.vq_dim,
+        #                                xy_size = args.vq_spatial_dim)
+
     if not args.use_layered_context:
         context_model = ContextModel(args.num_centers, args.vq_dim)
     else:
-        context_model = ContextModelMultilayered(args.num_centers, args.vq_dim, args.latent_dim // args.vq_dim, args.vq_spatial_dim)
+        # context on quantized values
+        #context_model = ContextModelMultilayered(args.num_centers, args.vq_dim, args.latent_dim // args.vq_dim, args.vq_spatial_dim)
+        # context on hard symbols
+        context_model = ContextModelMultilayered(args.num_centers, args.num_centers, args.latent_dim // args.vq_dim, 1)
 
     dropout = LayerDropout2d(args.dropout_factor, args.vq_dim)
 
@@ -129,7 +148,7 @@ def main():
     #print(encoder)
     #print(context_model)
     use_cuda = torch.cuda.is_available()
-    ce_loss = torch.nn.CrossEntropyLoss()
+    ce_loss = torch.nn.CrossEntropyLoss(reduce=not args.softplus)
     #ssim_loss = MS_SSIM(mode='sum')
     ssim_loss = MS_SSIM(mode='product')
     # TODO: proper MS-SSIM
@@ -206,8 +225,10 @@ def main():
         context_model.zero_grad()
 
         encoded = encoder(real_data_v)
+        #encoded, priors = encoder(real_data_v)
 
-        quantized, symbols = quantizer(encoded)
+        #quantized, symbols, scores = quantizer(encoded)
+        quantized, symbols, hard_symbols = quantizer(encoded)
 
 
         #TODO: move into quantizer
@@ -218,19 +239,35 @@ def main():
 
         #TODO: re-enable
         if args.use_context:
-            predictions = context_model(quantized)
+            # context on quantized map
+            #predictions = context_model(quantized)
+            # context on hard symbols
+            #print(hard_symbols.size())
+            predictions = context_model(hard_symbols)
             if args.context_smoothing:
                 predictions.mul_(1 - (args.num_centers/1024)).add_(1/1024)
             #print(symbols.size(), predictions.size())
 
             #coding_loss = ce_loss(predictions.view(-1, args.num_centers), 
             #                      symbols.view(-1))
+
             coding_loss = ce_loss(predictions, symbols)
+            if args.softplus:
+                coding_loss = F.softplus((coding_loss - 1.3) * 2) * 0.5 + 1.3
+                coding_loss = coding_loss.mean()
+        #TODO: hack!
+        else:
+        #if True:
+            # score the quantizer based on how specific it was
+            scores = scores.transpose(1,2)
+            #print(symbols.size())
+            coding_loss = ce_loss(scores, symbols)
         if args.use_dropout:
             quantized = dropout(quantized)
 
         decoded = decoder(quantized)
-            
+        #decoded = decoder(quantized, priors)
+        #print(decoded.size(), real_data_v.size())
         #loss = mse_loss(decoded, real_data_v)
         ssim = ssim_loss(decoded, real_data_v)
         loss = 1 - ssim
@@ -240,13 +277,13 @@ def main():
             #     ortho_loss_v = autograd.Variable(ortho_loss_d)
             #     orthoreg.orthoreg_loss(netD, ortho_loss_v)
             #     loss += ortho_loss_v
-        if args.use_context:
+        if args.use_context or True:
             # sorta best-working:
             #(loss + beta*ssim*coding_loss).backward()
             # original formulation:
-            (loss + beta*coding_loss).backward()
+            torch.log(loss + beta*coding_loss).backward()
         else:
-            loss.backward()
+            torch.log(loss.backward())
         #(loss + beta*coding_loss - ssim*coding_loss).backward()
         
         #(loss*3*coding_loss.detach() + ssim*coding_loss).backward()

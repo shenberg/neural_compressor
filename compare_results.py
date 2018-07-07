@@ -25,5 +25,6 @@ def compare_dirs(src_dir, enc_dir, dec_dir):
         print('{}, {}'.format(similarity, enc_size / pixels))
     print('done, totals: (avg ssim, avg br)')
     print('{}, {}'.format(sum(similarities) / len(similarities), total_encoded_size / total_pixels))
+    print(total_encoded_size, total_pixels)
 
 compare_dirs(src_dir, enc_dir, dec_dir)

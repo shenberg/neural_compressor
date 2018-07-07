@@ -330,6 +330,49 @@ class PSPUpsample(nn.Module):
         return self.conv(p)
 
 
+class PSPPriors(nn.Module):
+    def __init__(self, features, sizes=(1, 2)):
+        super().__init__()
+        self.stages = []
+        self.stages = nn.ModuleList([self._make_stage(features, size) for size in sizes])
+
+    def _make_stage(self, features, size, features_priors=16):
+        prior = nn.AdaptiveAvgPool2d(output_size=(size, size))
+        conv = nn.Conv2d(features, features_priors, kernel_size=1, bias=True)
+        return nn.Sequential(prior, conv)
+
+    def forward(self, feats):
+        return [stage(feats) for stage in self.stages]
+
+
+class PSPBottleneck(nn.Module):
+    def __init__(self, features, out_features=1024, features_priors=16, sizes=(1, 2)):
+        super().__init__()
+        self.bottleneck = nn.Conv2d(features + features_priors * (len(sizes)), out_features, kernel_size=1)
+        self.relu = nn.ReLU()
+
+    def forward(self, feats, priors):
+        h, w = feats.size(2), feats.size(3)
+        priors_us = [F.upsample(input=prior, size=(h, w), mode='bilinear') for prior in priors] + [feats]
+        bottle = self.bottleneck(torch.cat(priors_us, 1))
+        return self.relu(bottle)
+
+
+class PSPUpsample(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, 3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.PReLU()
+        )
+
+    def forward(self, x):
+        h, w = 2 * x.size(2), 2 * x.size(3)
+        p = F.upsample(input=x, size=(h, w), mode='bilinear')
+        return self.conv(p)
+
+
 class AutoEncoderPSP(nn.Module):
     def __init__(self, dim=64, encoding_dim=128, input_size=64, use_layer_norm=False, fc=False, extra_conv=False, layers=3):
         super().__init__()
